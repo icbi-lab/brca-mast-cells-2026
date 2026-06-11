@@ -1,0 +1,307 @@
+---
+title: "scRNAseq"
+params:
+  data: "../data"
+---
+
+Analysis of immunological signatures in the single-cell atlas from Chen et al. (2026)
+- Part 1: Prepare data
+- Part 2: Analysis
+
+Before running the analysis, download both the .h5ad file for the global atlas from cellxgene and ST1 from Chen et al. (2026) into *params$data/scatlas*.
+Running the code in part 1 will save the prepared data to *params$data/scatlas/seu.rds*.
+Running the code in part 2 will save the analysis results to *params$data/sc_results.rds*.
+To use CIBERSORT, an academic license needs to be obtained and the script and signature files should be placed into *lib/cibersort*.
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(immunedeconv)
+library(anndata)
+library(Seurat)
+library(DESeq2)
+library(liana)
+library(AUCell)
+bcra_env <- new.env()
+source(file.path("..", "lib", "r-functions.R"), local = bcra_env) |> invisible()
+attach(bcra_env)
+dir.create(params$data, showWarnings = FALSE)
+set_cibersort_mat(file.path("..", "lib", "cibersort", "LM22.txt"))
+knitr::opts_chunk$set(fig.width = 10, fig.height = 4)
+```
+
+#### Prepare Data
+
+Load and convert adata
+```{r}
+adata <- read_h5ad(fp(params$data, "scatlas", "adata.h5ad"))
+seu <- CreateSeuratObject(counts = t(as.matrix(adata$raw)), meta.data = adata$obs, min.features = 0, min.cells = 0)
+LayerData(seu, assay = "RNA", layer = "data") <- t(adata$X)
+seu@assays$RNA@meta.data <- adata$var[Features(seu[["RNA"]]),]
+seu@misc <- adata$uns
+mat <- adata$obsm$X_rpca
+rownames(mat) <- rownames(adata)
+colnames(mat) <- paste0("PC_", 1:ncol(mat))
+seu@reductions$rpca <- CreateDimReducObject(embeddings = mat, key = "PC_", assay = "RNA")
+mat <- adata$obsm$X_umap
+rownames(mat) <- rownames(adata)
+colnames(mat) <- paste0("UMAP_", 1:ncol(mat))
+seu@reductions$umap <- CreateDimReducObject(embeddings = mat, key = "UMAP_", assay = "RNA")
+seu@assays$RNA@meta.data$symbol <- sub("_ENSG.*", "", seu@assays$RNA@meta.data$feature_name)
+ix <- duplicated(seu@assays$RNA@meta.data$symbol)
+seu@assays$RNA@meta.data$symbol[ix] <- seu@assays$RNA@meta.data$feature_name[ix]
+rownames(seu@assays$RNA@meta.data) <- seu@assays$RNA@meta.data$symbol
+rownames(seu@assays$RNA) <- seu@assays$RNA@meta.data$symbol
+```
+
+Re-map cell types
+```{r}
+ctmap <- c(
+  "malignant cell" = "cancer cell",
+
+  "cycling T cell" = "T cell",
+  "naive T cell" = "T cell",
+  "memory B cell" = "B cell",
+  "effector memory CD4-positive, alpha-beta T cell" = "T cell",
+  "effector memory CD8-positive, alpha-beta T cell" = "T cell",
+  "exhausted T cell" = "T cell",
+  "CD8-positive, alpha-beta regulatory T cell" = "T cell",
+  "T follicular helper cell" = "T cell",
+  "CD4-positive helper T cell" = "T cell",
+  "CD4-positive, CD25-positive, CCR4-positive, alpha-beta regulatory T cell" = "T cell",
+
+  "natural killer cell" = "NK cell",
+
+  "IgG plasma cell" = "B cell",
+
+  "macrophage" = "macrophage",
+  "cycling macrophage" = "macrophage",
+  
+  "mast cell" = "mast cell",
+
+  "conventional dendritic cell" = "dendritic cell",
+  "plasmacytoid dendritic cell" = "dendritic cell",
+  "myeloid dendritic cell" = "dendritic cell",
+
+  "vein endothelial cell" = "endothelial cell",
+  "endothelial cell of vascular tree" = "endothelial cell",
+  "endothelial cell" = "endothelial cell",
+  "endothelial cell of artery" = "endothelial cell",
+  "capillary endothelial cell" = "endothelial cell",
+
+  "fibroblast" = "stromal cell",
+  "myofibroblast cell" = "stromal cell",
+  "cycling stromal cell" = "stromal cell",
+
+  "vascular associated smooth muscle cell" = "smooth muscle cell",
+  "pericyte" = "pericyte"
+)
+
+seu@meta.data$cell_type_coarse <- ctmap[as.character(seu$cell_type)]
+```
+
+PAM50
+```{r}
+pred <- readxl::read_xlsx(fp(params$data, "scatlas", "SuppTable1.xlsx"), sheet = 1) |> as.data.frame() |> col2rownames(donor_id)
+pred_max <- apply(pred, 1, function(x) names(pred)[which.max(x)])
+seu@meta.data$PAM50 <- pred_max[seu@meta.data$donor_id]
+```
+
+```{r}
+saveRDS(seu, fp(params$data, "scatlas", "seu.rds"))
+```
+
+
+#### Analysis
+
+```{r}
+seu <- readRDS(fp(params$data, "scatlas", "seu.rds"))
+sc <- list()
+```
+
+Prepare metadata
+```{r}
+mdf <- seu@meta.data |> group_by(donor_id) |>
+  summarise(mast_cell_n = sum(cell_type_coarse == "mast cell"), total_cell_n = n()) |>
+  arrange(desc(mast_cell_n)) |> as.data.frame()
+rownames(mdf) <- mdf$donor_id
+mdf$mast_cell_frac <- mdf$mast_cell_n / mdf$total_cell_n
+n_all <- seu@meta.data |> group_by(donor_id) |> summarise(n_cells = n())
+n_mast <- subset(seu@meta.data, cell_type_coarse == "mast cell") |> group_by(donor_id) |> summarise(n_mast_cells = n())
+
+# stratify by total mast cell number
+mdf$mast_cell_hilo <- mdf$mast_cell_n |> stratify()
+seu@meta.data$mast_cell_hilo <- mdf[seu@meta.data$donor_id,"mast_cell_hilo"]
+
+# stratify by mast cell fraction of total cells
+mdf$mast_cell_hilo <- mdf$mast_cell_frac |> stratify()
+seu@meta.data$mast_cell_hilo <- mdf[as.character(seu@meta.data$donor_id), "mast_cell_hilo"]
+seu@meta.data$mast_cell_frac <- mdf[as.character(seu@meta.data$donor_id), "mast_cell_frac"]
+```
+
+Check composition
+```{r}
+ptdf <- seu@meta.data |> dplyr::select(donor_id, batch, grade, organism, sex, tissue, mast_cell_hilo, mast_cell_frac, PAM50) |> unique()
+all(table(ptdf$donor_id) == 1)
+rownames(ptdf) <- as.character(ptdf$donor_id)
+n_all <-subset(seu@meta.data) |> group_by(donor_id) |> summarise(n_cells = n())
+n_mast <- subset(seu@meta.data, cell_type_coarse == "mast cell") |> group_by(donor_id) |> summarise(n_mast_cells = n())
+ptdf <- dplyr::left_join(ptdf, n_all, by = "donor_id")
+ptdf <- dplyr::left_join(ptdf, n_mast, by = "donor_id")
+ptdf$n_mast_cells[is.na(ptdf$n_mast_cells)] <- 0
+ptdf$frac_mast_cells <- ptdf$n_mast_cells / ptdf$n_cells
+ptdf$mast_cell_hilo_check <- stratify(ptdf$frac_mast_cells)
+sc$ptdf <- ptdf
+```
+
+Test patient composition
+```{r}
+cts <- unique(seu@meta.data$cell_type_coarse)
+ptct <- lapply(setNames(cts, cts), function(ct){
+  df <- dplyr::filter(seu@meta.data, cell_type_coarse == ct) |> group_by(donor_id) |> summarise(n = n()) |> as.data.frame()
+  colnames(df) <- c("donor_id", paste0("n_", ct))
+  df
+}) |> Reduce(f = dplyr::full_join)
+ptct[is.na(ptct)] <- 0
+
+meta_full <- dplyr::full_join(dplyr::select(sc$ptdf, -c(organism, tissue, mast_cell_frac, n_mast_cells, mast_cell_hilo_check, frac_mast_cells)), ptct)
+tmp <- select(ptct, -donor_id)
+frac <- tmp / rowSums(tmp)
+frac$donor_id <- ptct$donor_id
+meta_frac <- dplyr::full_join(dplyr::select(sc$ptdf, -c(organism, tissue, mast_cell_frac, n_mast_cells, mast_cell_hilo_check, frac_mast_cells)), frac)
+
+sc$meta_frac <- meta_frac
+tab_grade <- get_contable(filter(meta_frac, grade != "nan") |> droplevels(), "mast_cell_hilo", "grade") |> t() |> as.data.frame()
+fisher.test(tab_grade) # p-value = 0.03479
+fisher.test(tab_grade[-2,]) # p-value = 0.01436
+fisher.test(tab_grade[-3,]) # p-value = 0.04074
+
+tab_pam50 <- get_contable(meta_frac, "mast_cell_hilo", "PAM50") |> t() |> as.data.frame()
+fisher.test(tab_pam50) # p-value = 0.1199
+fisher.test(tab_pam50[-5,]) # p-value = 0.1785
+```
+
+Test celltype fractions
+```{r}
+colnames(meta_frac) <- gsub(" ", "_", colnames(meta_frac))
+vars <- setdiff(grep("n_", colnames(meta_frac), value = TRUE), c("n_cells"))
+test_wilcox <- function(df, test_var, ref_var, ...){
+  groups <- unique(df[[ref_var]])
+  stopifnot(length(groups) == 2)
+  wilcox.test(df[[test_var]][df[[ref_var]] == groups[2]], df[[test_var]][df[[ref_var]] == groups[1]], ...)
+}
+res <- (vars %S>% function(var){test_wilcox(meta_frac, test_var = var, ref_var = "mast_cell_hilo")$p.value}) |> data.frame()
+colnames(res) <- "p.value"
+res$padj <- res$p.value |> p.adjust(method = "fdr")
+res <- res |> arrange(p.value) |> rownames2col(celltype)
+res$celltype <- gsub("n_", "", res$celltype)
+sc$composition_celltypes <- res
+```
+
+DEG and GSEA
+```{r}
+if (!file.exists(fp(params$data, "genesets.rds"))){
+  gs <- getMSigDB(c("H", "C2|CP:KEGG_LEGACY", "C5|GO:BP|GO:CC|GO:MF"))
+  saveRDS(gs, fp(params$data, "genesets.rds"))
+} else {
+  gs <- readRDS(fp(params$data, "genesets.rds"))
+}
+```
+
+All celltypes
+```{r}
+seu$group_mast_hilo <- paste0(as.character(seu$mast_cell_hilo), "-", as.character(seu$donor_id))
+aggr <- aggregate_counts(seu, group_by="group_mast_hilo", assay="RNA", layer="counts", min_cells=10)
+contrast <- list(mast_cell_hi_vs_lo = c("mast_cell_hilo", "Hi", "Lo"))
+cts <- c("all")
+sc$deg_all$deseq2 <- lapply(setNames(cts, cts), function(ct){
+  meta_ct <- subset(aggr$meta, n_cells > 20)
+  expr_ct <- aggr$expr[,colnames(aggr$expr) %in% rownames(meta_ct)]
+  expr_ct <- expr_ct[rowMeans(expr_ct) > 10,]
+  res <- runDESeq2(as.matrix(expr_ct), design = meta_ct[colnames(expr_ct),], min_counts = 5, min_samples = 15,
+                   formula = ~ mast_cell_hilo + batch, contrasts = contrast)
+  res$results$mast_cell_hi_vs_lo
+})
+sc$deg_all$gsea <- sc$deg_all$deseq2 %L>% runGSEA(rank_by = "log2FC", genesets = gs)
+```
+
+Per celltype
+```{r}
+seu$group_mast_hilo <- paste0(as.character(seu$cell_type_coarse), "-", as.character(seu$mast_cell_hilo), "-", as.character(seu$donor_id))
+aggr <- aggregate_counts(seu, group_by="group_mast_hilo", assay="RNA", layer="counts", min_cells=10)
+contrast <- list(mast_cell_hi_vs_lo = c("mast_cell_hilo", "Hi", "Lo"))
+cts <- as.character(seu$cell_type_coarse) |> unique()
+cts <- setdiff(cts, "mast cell")
+ 
+sc$deg_cts$deseq2 <- lapply(setNames(cts, cts), function(ct){
+  print(ct)
+  meta_ct <- subset(aggr$meta, cell_type_coarse == ct & n_cells > 20)
+  expr_ct <- aggr$expr[,colnames(aggr$expr) %in% rownames(meta_ct)]
+  expr_ct <- expr_ct[rowMeans(expr_ct) > 10,]
+  res <- runDESeq2(as.matrix(expr_ct), design = meta_ct[colnames(expr_ct),], min_counts = 5, min_samples = 15,
+                   formula = ~ mast_cell_hilo + batch, contrasts = contrast)
+  res$results$mast_cell_hi_vs_lo
+})
+sc$deg_cts$gsea <- sc$deg_cts$deseq2 %L>% runGSEA(rank_by = "log2FC", genesets = gs)
+```
+
+LIANA
+```{r}
+seu@assays$RNA@layers$data <- GetAssayData(seu, assay="RNA", slot="data") |> as.matrix() |> as("dgCMatrix")
+seu$samples <- seu$donor_id
+Idents(seu) <- "cell_type_coarse"
+liana_res <- liana_wrap(
+  sce = seu,
+  method = c("cellphonedb", "connectome", "natmi", "logfc", "sca"),
+  species = "human"
+)
+sc$liana_consensus <- liana_aggregate(liana_res)
+```
+
+Mast cell subclustering
+```{r}
+seu_mast <- subset(seu, seu@meta.data$cell_type_coarse == "mast cell")
+seu_mast <- FindNeighbors(seu_mast, reduction = "rpca", graph.name = "RPCA_nn", dims = 1:20)
+seu_mast <- FindClusters(seu_mast, algorithm = 4, cluster.name = "mast_sub", graph.name = "RPCA_nn", resolution = 0.2)
+seu_mast <- RunUMAP(seu_mast, dims = 1:20, reduction = "rpca")
+DimPlot(seu_mast, reduction = "umap", group.by = c("mast_sub", "batch"))
+
+seu_mast <- subset(seu_mast, seu_mast$mast_sub != "3")
+seu_mast <- FindNeighbors(seu_mast, reduction = "rpca", graph.name = "RPCA_nn", dims = 1:20)
+seu_mast <- FindClusters(seu_mast, algorithm = 4, cluster.name = "mast_sub", graph.name = "RPCA_nn", resolution = 0.2)
+seu_mast <- RunUMAP(seu_mast, dims = 1:20, reduction = "rpca")
+DimPlot(seu_mast, reduction = "umap", group.by = c("mast_sub", "batch"))
+
+markergenes <- findMarkers(seu_mast, logfc.thresh = 0.2, min.pct = 0.1, group.by = "mast_sub", slot="counts", layer = "RNA")
+topmarkers <- markergenes |> dplyr::arrange(p_val, desc(abs(avg_log2FC)), desc(abs(pct.diff))) |> dplyr::pull(gene) |> unique()
+PlotDotplot(seu_mast, group.by = "mast_sub", features = topmarkers[1:10]) & theme(axis.text = element_text(size = 7))
+sc$seu_mast <- seu_mast
+```
+
+Check CIBERSORT signatures
+```{r}
+cbs_sig <- read.delim(immunedeconv:::config_env$cibersort_mat)
+rownames(cbs_sig) <- cbs_sig$Gene.symbol
+csb_z <- matScale(dplyr::select(cbs_sig, -Gene.symbol), rows = TRUE)
+csb_z$logratio <- log2(cbs_sig$Mast.cells.activated / cbs_sig$Mast.cells.resting)
+mast_sig <- list()
+mast_sig$act <- csb_z |> filter(Mast.cells.activated > 0 & abs(logratio) > 0.5) |> arrange(desc(Mast.cells.activated)) |> rownames()
+mast_sig$rest <- csb_z |> filter(Mast.cells.resting > 0 & abs(logratio) > 0.5) |> arrange(desc(Mast.cells.resting)) |> rownames()
+zeros = rowMeans(GetAssayData(sc$seu_mast, assay="RNA", slot="counts") == 0)
+mast_sig$act <- mast_sig$act[mast_sig$act %in% names(zeros)[zeros < 0.95]]
+mast_sig$rest <- mast_sig$rest[mast_sig$rest %in% names(zeros)[zeros < 0.95]]
+mast_sig$act <- mast_sig$act[1:min(mast_sig %S>% length())]
+mast_sig$rest <- mast_sig$rest[1:min(mast_sig %S>% length())]
+
+aures <- GetAssayData(sc$seu_mast, assay="RNA", slot="counts") |> as.matrix() |> AUCell_run(geneSets = mast_sig)
+all(colnames(aures) == colnames(sc$seu_mast))
+sc$seu_mast$auc_act <- getAUC(aures)["act",]
+sc$seu_mast$auc_rest <- getAUC(aures)["rest",]
+sc$seu_mast@meta.data$counts_hilo <- stratify(sc$seu_mast@meta.data$nCount_RNA)
+sc$seu_mast$auc_logratio <- log2(sc$seu_mast$auc_act + 0.01) - log2(sc$seu_mast$auc_rest + 0.01)
+```
+
+```{r}
+saveRDS(sc, fp(params$data, "sc_results.rds"))
+```

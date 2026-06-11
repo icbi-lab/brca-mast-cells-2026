@@ -1,0 +1,673 @@
+---
+title: "METABRIC"
+params:
+  data: "../data"
+---
+
+Analysis of immunological signatures in METABRIC
+- Part 1: Prepare data
+- Part 2: Analysis
+
+Running the code in part 1 will download data associated with METABRIC and save them to *params$data/mb.rds*.
+Running the code in part 2 will save the analysis results to *params$data/mb_results.rds*.
+To use CIBERSORT, an academic license needs to be obtained and the script and signature files should be placed into *lib/cibersort*.
+
+```{r setup}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(immunedeconv)
+library(survival)
+library(limma)
+library(matrixStats)
+bcra_env <- new.env()
+source(file.path("..", "lib", "r-functions.R"), local = bcra_env) |> invisible()
+attach(bcra_env)
+dir.create(params$data, showWarnings = FALSE)
+set_cibersort_binary(file.path("..", "lib", "cibersort", "CIBERSORT.R"))
+set_cibersort_mat(file.path("..", "lib", "cibersort", "LM22.txt"))
+knitr::opts_chunk$set(fig.width = 10, fig.height = 4)
+```
+
+
+#### Prepare Data
+
+Clinical and expression data
+```{r}
+# cbioportal
+if (!dir.exists(fp(params$data, "METABRIC", "brca_metabric"))){
+  download.file(url = "https://cbioportal-datahub.s3.amazonaws.com/brca_metabric.tar.gz",
+                destfile = fp(params$data, "METABRIC", "brca_metabric.tar.gz"), method = "curl")
+  untar(tarfile = fp(params$data, "METABRIC", "brca_metabric.tar.gz"), exdir = fp(params$data, "METABRIC"))
+  unlink(fp(params$data, "METABRIC", "brca_metabric.tar.gz"))
+}
+
+# clincal follow-up data from Rueda et al, 2019
+if (!file.exists(fp(params$data, "METABRIC", "rueda_clinical", "Rueda_ST5.txt"))){
+  dir.create(fp(params$data, "METABRIC", "rueda_clinical"), showWarnings = FALSE)
+  download.file(url = "https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-019-1007-8/MediaObjects/41586_2019_1007_MOESM7_ESM.txt",
+              destfile = fp(params$data, "METABRIC", "rueda_clinical", "Rueda_ST5.txt"))
+  download.file("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-019-1007-8/MediaObjects/41586_2019_1007_MOESM10_ESM.xls",
+              destfile = fp(params$data, "METABRIC", "rueda_clinical", "Rueda_ST5_info.xls"))
+}
+
+mb <- load_metabric_data(fp(params$data, "METABRIC"))
+mb$metadata <- load_metabric_metadata(fp(params$data, "METABRIC"))
+colnames(mb$metadata) <- colnames(mb$metadata) |> tolower()
+mb$metadata$ID <- rownames(mb$metadata)
+mb$metadata <- mb$metadata |> dplyr::rename(subcohort = cohort, er_status_by_ihc = er_ihc, pr_status_by_ihc = pr_status, her2_status_by_ihc = her2_status)
+mb$expr <- merge_rows(dplyr::select(mb$expr, -c(Hugo_Symbol, Entrez_Gene_Id)), ids = mb$expr$Hugo_Symbol, FUN = \(x) mean(x, na.rm = TRUE))
+mb$expr_zscores <- merge_rows(dplyr::select(mb$expr_zscores, -c(Hugo_Symbol, Entrez_Gene_Id)), ids = mb$expr_zscores$Hugo_Symbol, FUN = \(x) mean(x, na.rm = TRUE))
+```
+
+Mutations and TMB
+```{r}
+mb_maf <- mb$mutations |> maftools::read.maf(isTCGA = FALSE)
+mb_tmb <- maftools::tmb(mb_maf, captureSize = 1)
+mb$tmb <- mb_tmb |> dplyr::rename(ID = Tumor_Sample_Barcode, TMB_rate_maf = total_perMB, TMB_count_maf = total)
+mb$metadata$TMB_rate_maf <- NULL
+mb$metadata$TMB_count_maf <- NULL
+mb$metadata <- dplyr::left_join(x = mb$metadata, y = dplyr::select(mb$tmb, TMB_rate_maf, TMB_count_maf, ID), by = "ID")
+rownames(mb$metadata) <- mb$metadata$ID
+mb$metadata$TMB3 <- ifelse(mb$metadata$TMB_rate_maf > 3, ">3mutpMB", "<3mutpMB")
+mb$metadata$TMB10 <- ifelse(mb$metadata$TMB_count_maf > 10, ">10mutpMB", "<10mutpMB")
+
+# use the available TMB:
+mb$metadata$TMB_count <- mb$metadata$tmb_nonsynonymous 
+mb$metadata$TMB_count_median <- stratify(mb$metadata$TMB_count)
+mb$metadata$TMB_count_group <- ifelse(mb$metadata$TMB_count > quantile(mb$metadata$TMB_count, probs = 0.9, na.rm = TRUE), "high (>90%)", "low (<90%)")
+```
+
+Survival definitions
+```{r}
+# Overall survival
+mb$os <- data.frame(row.names = rownames(mb$metadata))
+mb$os$time <- mb$metadata$os_months
+mb$os$status <- NA
+mb$os$status[mb$metadata$vital_status %in% c("Died of Disease", "Died of Other Causes")] <- 1
+mb$os$status[mb$metadata$vital_status %in% "Living"] <- 0
+mb$metadata$os_status
+
+# Disease-specific survival
+mb$dss <- data.frame(row.names = rownames(mb$metadata))
+mb$dss$time <- mb$metadata$os_months
+mb$dss$status <- NA
+mb$dss$status[mb$metadata$vital_status %in% "Died of Other Causes"] <- 0
+mb$dss$status[mb$metadata$vital_status %in% "Died of Disease"] <- 1
+mb$dss$status[mb$metadata$vital_status %in% "Living"] <- 0
+
+# Recurrence-free survival
+mb$dfs <- data.frame(row.names = rownames(mb$metadata))
+mb$dfs$status = sub(":.*", "",  mb$metadata$rfs_status) |> as.numeric()
+mb$dfs$time = mb$metadata$rfs_months
+
+# we can check in more detail how to get these data:
+mb$dfs_times <- data.frame(row.names = rownames(mb$metadata))
+mb$dfs_events <- data.frame(row.names = rownames(mb$metadata))
+mb$dfs_events$dss_death <- mb$dss$status
+mb$dfs_events$dss_death[is.na(mb$dfs_events$dss_death)] <- 0
+mb$dfs_events$lr <- mb$metadata$lr
+mb$dfs_events$dr <- mb$metadata$dr
+mb$dfs_status <- as.numeric(rowSums(mb$dfs_events) > 0)
+mb$dfs_times$dss_time <- mb$dss$time
+mb$dfs_times$tlr <- mb$metadata$tlr / 30 # originally 30 was, so here we use the same
+mb$dfs_times$tdr <- mb$metadata$tdr / 30
+mb$dfs_time <- matrixStats::rowMins(data.matrix(mb$dfs_times), na.rm = TRUE)
+mb$dfs_time[is.infinite(mb$dfs_time)] <- NA
+
+# convert to years
+mb$os_years <- mb$os |> dplyr::mutate(time = time * 30 / 365.2425)
+mb$dss_years <- mb$dss |> dplyr::mutate(time = time * 30 / 365.2425)
+mb$dfs_years <- mb$dfs |> dplyr::mutate(time = time * 30 / 365.2425)
+```
+
+Receptor subtype definitions
+```{r}
+mb$metadata$er_status_by_ihc[mb$metadata$er_status_by_ihc == "Positve"] <- "Positive" # typo
+
+# TNBC definition from https://doi.org/10.1038%2Fs41598-021-83913-7
+mb$metadata$er_status_by_ihc[mb$metadata$er_status_by_ihc == ""] <- NA
+tnbc_cases <- subset(mb$metadata, er_status_by_ihc == "Negative" & her2_status_by_ihc == "Negative" & her2_snp6 != "GAIN" & pr_status_by_ihc == "Negative")
+tnbc_cases <- subset(tnbc_cases, histological_subtype == "Ductal/NST") # none
+tnbc_cases <- subset(tnbc_cases, er_status == "Negative") 
+mb$metadata$TNBC <- rownames(mb$metadata) %in% rownames(tnbc_cases)
+sum(mb$metadata$TNBC) # this would result in 199 cases, as in paper
+mb$metadata$ER_status <- ifelse(mb$metadata$er_status_by_ihc %in% "Positive", "ER+", "ER?")
+mb$metadata$ER_status[mb$metadata$er_status_by_ihc == "Negative"] <- "ER-"
+mb$metadata$PR_status <- ifelse(mb$metadata$pr_status_by_ihc %in% "Positive", "PR+", "PR?")
+mb$metadata$PR_status[mb$metadata$pr_status_by_ihc == "Negative"] <- "PR-"
+mb$metadata$HER2_status <- "HER2?"
+mb$metadata$HER2_status[mb$metadata$her2_status_by_ihc == "Positive" & mb$metadata$her2_snp6 != "LOSS"] <- "HER2+"
+mb$metadata$HER2_status[mb$metadata$her2_status_by_ihc == "Negative" & mb$metadata$her2_snp6 != "GAIN"] <- "HER2-"
+
+# combine
+mb$metadata <- mb$metadata |> mutate(receptor_status = paste0(ER_status, PR_status, HER2_status))
+mb$metadata$receptor_status |> table() |> sort(decreasing = TRUE)
+
+# IHC three-group (HR+HER2-; HER2+; TNBC)
+mb$metadata$receptor_subtype <- "other"
+mb$metadata$receptor_subtype[mb$metadata$HER2_status == "HER2+"] <- "HER2+"
+mb$metadata$receptor_subtype[mb$metadata$HER2_status == "HER2-" & (mb$metadata$ER_status == "ER+" | mb$metadata$PR_status == "PR+")] <- "HR+HER2-"
+#mb$metadata$receptor_subtype[mb$metadata$HER2_status == "HER2-" & mb$metadata$ER_status == "ER-"] <- "TNBC"
+mb$metadata$receptor_subtype[mb$metadata$receptor_status == "ER-PR-HER2-"] <- "TNBC"
+mb$metadata$TNBC <- ifelse(mb$metadata$receptor_subtype == "TNBC", "yes", "no")
+```
+
+Discovery/validation cohort and PAM50_subtype
+```{r}
+if (!file.exists(fp(params$data, "METABRIC", "other", "Curtis_ST"))){
+  download.file(url = "https://static-content.springer.com/esm/art%3A10.1038%2Fnature10983/MediaObjects/41586_2012_BFnature10983_MOESM266_ESM.zip",
+                destfile = fp(params$data, "METABRIC", "other", "41586_2012_BFnature10983_MOESM266_ESM.zip"))
+    system(paste0("unzip ", fp(params$data, "METABRIC", "other", "41586_2012_BFnature10983_MOESM266_ESM.zip"), " -d ",
+                fp(params$data, "METABRIC", "other", "Curtis_ST")), intern = TRUE, ignore.stdout = TRUE)
+}
+
+mb_discovery = read.delim(fp(params$data, "METABRIC", "other", "Curtis_ST", "2011-04-05112E-Tables_S1-S6", "table_S2_revised.txt"))
+mb_discovery$METABRIC_ID <- sub("-", "", mb_discovery$METABRIC_ID)
+mb_validation = read.delim(fp(params$data, "METABRIC", "other", "Curtis_ST", "2011-04-05112E-Tables_S1-S6", "table_S3_revised.txt"))
+mb_validation$METABRIC_ID <- sub("-", "", mb_validation$METABRIC_ID)
+mb$metadata$cohort <- "undef"
+mb$metadata$cohort[mb$metadata$ID %in% mb_discovery$METABRIC_ID] <- "discovery"
+mb$metadata$cohort[mb$metadata$ID %in% mb_validation$METABRIC_ID] <- "validation"
+
+mb$metadata$PAM50_subtype <- NA
+mb$metadata[mb_discovery$METABRIC_ID,]$PAM50_subtype <- mb_discovery$Pam50Subtype
+mb$metadata[mb_validation$METABRIC_ID,]$PAM50_subtype <- mb_validation$Pam50Subtype
+mb$metadata$PAM50_subtype[mb$metadata$PAM50_subtype == "Her2"] <- "Her2e"
+mb$metadata$PAM50_subtype[mb$metadata$PAM50_subtype == "NC"] <- NA
+```
+
+Recode
+```{r}
+mb$metadata[mb$metadata == ""] <- NA
+mb$metadata$cellularity <- mb$metadata$cellularity |> tolower()
+mb$metadata$chemotherapy <- mb$metadata$chemotherapy |> tolower()
+mb$metadata$er_status_by_ihc <- mb$metadata$er_status_by_ihc |> tolower()
+mb$metadata$her2_snp6 <- mb$metadata$her2_snp6 |> tolower()
+mb$metadata$hormone_therapy <- mb$metadata$hormone_therapy |> tolower()
+mb$metadata$inferred_menopausal_state <- mb$metadata$inferred_menopausal_state |> tolower()
+mb$metadata$sex <- mb$metadata$sex |> tolower()
+mb$metadata$laterality <- mb$metadata$laterality |> tolower()
+mb$metadata$radio_therapy <- mb$metadata$radio_therapy |> tolower()
+mb$metadata$breast_surgery <- mb$metadata$breast_surgery |> tolower()
+mb$metadata$cancer_type_detailed <- mb$metadata$cancer_type_detailed |> tolower()
+mb$metadata$er_status <- mb$metadata$er_status |> tolower()
+mb$metadata$er_status <- mb$metadata$er_status |> tolower()
+mb$metadata$her2_status_by_ihc <- mb$metadata$her2_status_by_ihc |> tolower()
+mb$metadata$pr_status_by_ihc <- mb$metadata$pr_status_by_ihc |> tolower()
+mb$metadata$sample_type <- mb$metadata$sample_type |> tolower()
+mb$metadata$pr_status_by_ihc <- mb$metadata$pr_status_by_ihc |> tolower()
+mb$metadata$ct <- mb$metadata$ct |> tolower()
+mb$metadata$ht <- mb$metadata$ht |> tolower()
+mb$metadata$rt <- mb$metadata$rt |> tolower()
+mb$metadata$complete_rec_history <- mb$metadata$complete_rec_history |> tolower()
+
+# claudin subtypes
+mb$metadata$claudin_subtype[mb$metadata$claudin_subtype == "NC"] <- NA # not classified
+mb$metadata$claudin_subtype[mb$metadata$claudin_subtype == "claudin-low"] <- "Claudin-low"
+mb$metadata$claudin_subtype[mb$metadata$claudin_subtype == "Her2"] <- "Her2e"
+mb$metadata$claudin_subtype |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+
+# therapy (missing for 536 patients)
+mb$metadata$chemotherapy |>  table(useNA = "ifany")
+mb$metadata$hormone_therapy |>  table(useNA = "ifany")
+mb$metadata$radio_therapy |>  table(useNA = "ifany")
+mb$metadata$breast_surgery |>  table(useNA = "ifany")
+
+mb$metadata$therapy <- paste(ifelse(mb$metadata$chemotherapy == "yes", "CT", ""),
+                             ifelse(mb$metadata$hormone_therapy == "yes", "HT", ""),
+                             ifelse(mb$metadata$radio_therapy == "yes", "RT", ""), sep = "+")
+mb$metadata$therapy <- mb$metadata$therapy |>
+  gsub(pattern = "NA", replacement = "") |>
+  gsub(pattern = "^\\+*", replacement = "") |>
+  gsub(pattern = "++", replacement = "+", fixed = TRUE) |>
+  gsub(pattern = "\\+$", replacement = "")
+mb$metadata$therapy[is.na(mb$metadata$chemotherapy) | is.na(mb$metadata$hormone_therapy) | is.na(mb$metadata$radio_therapy)] <- NA
+mb$metadata$therapy[mb$metadata$therapy == ""] <- "none"
+
+# histological subtypes
+mb$metadata$histological_type |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+mb$metadata$histological_subtype_full <- mb$metadata$histological_subtype
+mb$metadata$histological_subtype <- NA
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Medullary"] <- "MC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Mucinous"] <- "MUC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Metaplastic"] <- "MPC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Lobular"] <- "ILC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Ductal/NST"] <- "IDC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Tubular/ cribriform"] <- "IDC-TC"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Mixed"] <- "other"
+mb$metadata$histological_subtype[mb$metadata$histological_subtype_full == "Other"] <- "other"
+mb$metadata$histological_subtype |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+mb$metadata$stage <- mb$metadata$tumor_stage
+mb$metadata <- mb$metadata |> dplyr::rename(NPI = npi, normal_sample_id = matched_normal_metabric_id, age = age_at_diagnosis, menopause_status = inferred_menopausal_state)
+```
+
+Deconvolution
+```{r}
+# prepare expression data
+impute_values <- rep(rowMins(data.matrix(mb$expr), na.rm = TRUE), ncol(mb$expr)) |> matrix(ncol =  ncol(mb$expr))
+mb$expr[is.na(mb$expr)] <- impute_values[is.na(mb$expr)]
+mb$pseudotpm <- 2^mb$expr
+
+# cibersort
+mb$cibersort_rel <- deconvolute_cibersort(mb$pseudotpm, perm=1000, QN = TRUE, absolute = FALSE, arrays = TRUE) 
+mb$cibersort_rel <- data.frame(t(mb$cibersort_rel))
+colnames(mb$cibersort_rel) <- gsub(".", "_", colnames(mb$cibersort_rel), fixed = TRUE)
+colnames(mb$cibersort_rel) <- gsub("__Tregs", "", colnames(mb$cibersort_rel))
+colnames(mb$cibersort_rel) <- gsub("_$", "", colnames(mb$cibersort_rel))
+mb$cibersort_rel$Correlation <- NULL
+mb$cibersort_rel$RMSE <- NULL
+
+# estimate
+mb$estimate <- immunedeconv::deconvolute_estimate(mb$pseudotpm) |> as.data.frame()
+mb$estimate <- data.frame(t(mb$estimate))
+```
+
+```{r}
+MHC <- get_mhc_genes()
+mb$metadata$HLA_I_mRNAs <- colSums(mb$expr[MHC$classI,], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$HLA_II_mRNAs <- colSums(mb$expr[MHC$classII,], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$B2M_mRNA <- colSums(mb$expr["B2M",], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$PDL1_mRNA <- colSums(mb$expr["CD274",], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$CD4_mRNA <- colSums(mb$expr["CD4",], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$CD8A_mRNA <- colSums(mb$expr["CD8A",], na.rm = TRUE)[mb$metadata$ID]
+mb$metadata$GZMA_mRNA <- colSums(mb$expr["GZMA",], na.rm = TRUE)[mb$metadata$ID]
+
+hist(mb$metadata$B2M_mRNA, 50)
+mb$metadata$B2M_mRNA_group <- ifelse(mb$metadata$B2M_mRNA > quantile(mb$metadata$B2M_mRNA, probs = 0.1, na.rm = TRUE), "normal (>10%)", "low (<10%)")
+hist(mb$metadata$HLA_I_mRNAs, 50)
+mb$metadata$HLA_I_mRNAs_group <- ifelse(mb$metadata$HLA_I_mRNAs > quantile(mb$metadata$HLA_I_mRNAs, probs = 0.1, na.rm = TRUE), "normal (>10%)", "low (<10%)")
+hist(mb$metadata$HLA_II_mRNAs, 50)
+mb$metadata$HLA_II_mRNAs_group <- ifelse(mb$metadata$HLA_II_mRNAs > quantile(mb$metadata$HLA_II_mRNAs, probs = 0.1, na.rm = TRUE), "normal (>10%)", "low (<10%)")
+hist(mb$metadata$PDL1_mRNA, 50)
+mb$metadata$PDL1_mRNA_group <- ifelse(mb$metadata$PDL1_mRNA > quantile(mb$metadata$PDL1_mRNA, probs = 0.9, na.rm = TRUE), "high (>90%)", "normal (<90%)")
+mb$metadata <- mb$metadata |> dplyr::select(-c(metabric_id, sample_id, cancer_type, sample_type, tumor_stage, histological_subtype_full))
+```
+
+Data cleanup
+```{r}
+# combine deconvolution results
+decon_res <- Reduce(f = function(x,y){ dplyr::full_join(x,y,by="ID")}, x = list(
+  mb$estimate |> dplyr::select(StromalScore, ImmuneScore) %>% mutate(ID = rownames(.)),
+  mb$cibersort_rel |> dplyr::rename_with( ~ paste0("Cbs_", .x)) %>% mutate(ID = rownames(.))
+))
+rownames(decon_res) <- decon_res$ID
+decon_res <- decon_res |> dplyr::rename(Cbs_B_memory = Cbs_B_cells_memory,
+                                        Cbs_CD8_T_cells = Cbs_T_cells_CD8,
+                                        Cbs_CD4_T_naive = Cbs_T_cells_CD4_naive,
+                                        Cbs_CD4_T_mem_resting = Cbs_T_cells_CD4_memory_resting,
+                                        Cbs_CD4_T_mem_activated = Cbs_T_cells_CD4_memory_activated,
+                                        Cbs_T_fh = Cbs_T_cells_follicular_helper,
+                                        Cbs_T_reg = Cbs_T_cells_regulatory,
+                                        Cbs_T_gd = Cbs_T_cells_gamma_delta,
+                                        Cbs_NK_resting = Cbs_NK_cells_resting,
+                                        Cbs_NK_activated = Cbs_NK_cells_activated,
+                                        Cbs_DC_resting = Cbs_Dendritic_cells_resting,
+                                        Cbs_DC_activated = Cbs_Dendritic_cells_activated)
+mb$vars$celltypes <- colnames(decon_res)
+
+df <- dplyr::inner_join(mb$metadata, decon_res, by="ID")
+df <- df |> dplyr::select(-starts_with(c("os", "dss", "dfs")), -patient_id, -ends_with("_barcode"))
+df <- df[,df |> sapply(function(x) sum(!is.na(x))>1 )]
+
+tab_receptor_status <- df$receptor_status |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+df$receptor_status[grepl("?", df$receptor_status, fixed = TRUE)] <- NA
+df$receptor_status[tab_receptor_status[df$receptor_status] < 40] <- NA
+df$receptor_status |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+df$receptor_status[df$receptor_status == "ER+PR+HER2-"] <- "E+P+"
+df$receptor_status[df$receptor_status == "ER+PR-HER2-"] <- "E+"
+df$receptor_status[df$receptor_status == "ER-PR-HER2-"] <- "---"
+df$receptor_status[df$receptor_status == "ER-PR-HER2+"] <- "H+"
+df$receptor_status[df$receptor_status == "ER+PR-HER2+"] <- "E+H+"
+df$receptor_status[df$receptor_status == "ER+PR+HER2+"] <- "E+P+H+"
+df$receptor_status |>  table(useNA = "ifany") |> sort(decreasing = TRUE)
+
+df$log_TMB_rate <- log10(df$TMB_rate + 1)
+df$TMB_rate <- NULL
+
+df$os <- Surv(mb$os[df$ID,]$time, mb$os[df$ID,]$status)
+df$dss <- Surv(mb$dss[df$ID,]$time, mb$dss[df$ID,]$status)
+df$dfs <- Surv(mb$dfs[df$ID,]$time, mb$dfs[df$ID,]$status)
+
+vars_celltypes <- setdiff(colnames(decon_res), c("ID", "StromalScore", "ImmuneScore", "Cbs_P_value"))
+ix <- vars_celltypes |> sub(pattern = "Bp_|Cbs_|Qs_", replacement = "") |> order()
+vars_celltypes <- c("ImmuneScore", "StromalScore", grep("HE_", colnames(df), value = TRUE), vars_celltypes[ix])
+names(vars_celltypes) <- vars_celltypes
+
+df$ER_status[grep("?", df$ER_status, fixed = TRUE)] <- NA
+df$ER_status <- factor(df$ER_status, ordered = TRUE, levels = c("ER-", "ER+")) # if ordered
+df$ER_status <- relevel(factor(df$ER_status, ordered = FALSE), ref = "ER-") # if not ordered
+
+df$PR_status[grep("?", df$PR_status, fixed = TRUE)] <- NA
+df$PR_status <- factor(df$PR_status, ordered = TRUE, levels = c("PR-", "PR+"))
+df$PR_status <- relevel(factor(df$PR_status, ordered = FALSE), ref = "PR-")
+
+df$HER2_status[grep("?", df$HER2_status, fixed = TRUE)] <- NA
+df$HER2_status <- factor(df$HER2_status, ordered = TRUE, levels = c("HER2-", "HER2+"))
+df$HER2_status <- relevel(factor(df$HER2_status, ordered = FALSE), ref = "HER2-")
+
+df$menopause_status <- factor(df$menopause_status, ordered = TRUE, levels = c("pre", "post"))
+df$stage_hi <- factor(ifelse(df$stage < 3, "low", "high"), ordered = TRUE, levels = c("low", "high"))
+df$stage_hi[df$stage == 0] <- NA
+df$stage_hi <- relevel(factor(df$stage_hi, ordered = FALSE), ref = "low")
+
+df$cellularity_hi <- factor(ifelse(df$cellularity %in% c("low", "moderate"), "low", "high"), ordered = TRUE, levels = c("low", "high"))
+df$cellularity_hi[is.na(df$cellularity)] <- NA
+df$cellularity_hi <- relevel(factor(df$cellularity_hi, ordered = FALSE), ref = "low")
+
+df$laterality <- factor(ifelse(df$breast_tumour_laterality == "l", "left", "right"), ordered = TRUE, levels = c("left", "right"))
+df$laterality[is.na(df$breast_tumour_laterality)] <- NA
+df$laterality <- relevel(factor(df$laterality, ordered = FALSE), ref = "left")
+
+df$lymph_nodes <- factor(ifelse(df$lymph_nodes_examined_positive > 0, "pos", "neg"), ordered = TRUE, levels = c("neg", "pos"))
+df$lymph_nodes[is.na(df$lymph_nodes_examined_positive)] <- NA
+df$lymph_nodes <- relevel(factor(df$lymph_nodes, ordered = FALSE), ref = "neg")
+
+df$TMB_count_median <- factor(df$TMB_count_median, ordered = TRUE, levels = c("Lo", "Hi"))
+df$TMB_count_median <- relevel(factor(df$TMB_count_median, ordered = FALSE), ref = "Lo")
+
+df$TMB10 <- factor(df$TMB_count_group, ordered = TRUE, levels = c("low (<90%)", "high (>90%)"))
+df$TMB10 <- relevel(factor(df$TMB10, ordered = FALSE), ref = "low (<90%)")
+
+df$receptor_subtype <- relevel(factor(df$receptor_subtype, ordered = FALSE), ref = "HR+HER2-")
+
+df$stage <- as.character(df$stage)
+df$stage[df$stage == "0"] <- NA
+df$stage[df$stage == "1"] <- "I"
+df$stage[df$stage == "2"] <- "II"
+df$stage[df$stage == "3"] <- "III"
+df$stage[df$stage == "4"] <- "IV"
+df$stage <- relevel(factor(df$stage, ordered = FALSE), ref = "I")
+
+mb$data <- df
+mb$data$histological_subtype[mb$data$histological_subtype %in% c("IDC-TC", "MC", "MPC", "MUC")] <- "other"
+mb$data$histological_subtype[is.na(mb$data$histological_subtype)] <- "other"
+
+mb$data$grade_hi <- NA
+mb$data$grade_hi[mb$data$grade %in% c(1,2)] <- "low"
+mb$data$grade_hi[mb$data$grade %in% c(3,4)] <- "high"
+
+mb$data$receptor_group <- "other"
+mb$data$receptor_group[mb$data$receptor_status %in% c("E+", "E+P+")] <- "E+(P+)"
+mb$data$receptor_group[mb$data$receptor_status %in% c("H+", "E+H+", "E+P+H+")] <- "H+(E+)(P+)"
+mb$data$receptor_group[mb$data$receptor_status %in% c("---")] <- "---"
+mb$data$receptor_group[is.na(mb$data$receptor_status)] <- NA
+
+saveRDS(mb, fp(params$data, "mb.rds"))
+```
+
+
+#### Analysis
+
+```{r}
+mb <- readRDS(fp(params$data, "mb.rds"))
+mb$results <- list()
+```
+
+```{r}
+mb$data$receptor_subtype |> table(useNA = "always")
+mb$data$ER_status |> table(useNA = "always")
+mb$data$PR_status |> table(useNA = "always")
+mb$data$HER2_status |> table(useNA = "always")
+mb$data$histological_subtype |> table(useNA = "always")
+mb$data$stage |> table(useNA = "always")
+mb$data$grade |> table(useNA = "always")
+mb$data$PAM50_subtype |> table(useNA = "always")
+mb$data[,c("PAM50_subtype", "HER2_status")] |> table(useNA = "always")
+```
+
+```{r}
+df <- mb$data
+cts <- grep("Cbs_", mb$vars$celltypes, value = T)
+x_vars <- setdiff(cts, c("ID", "Cbs_P_value", "Cbs_absolute_score"))
+x_vars <- c("ImmuneScore", "StromalScore", x_vars)
+for (var in x_vars){
+  df[[var]] <- scale(df[[var]])
+}
+```
+
+Multivariate analysis of all patients
+```{r}
+# variables
+co_vars <-  c("stage", "age", "receptor_subtype") # covariates
+y_vars = c("os", "dss", "dfs", "stage_hi", "ER_status", "PR_status", "HER2_status") # survival/clinical
+
+# testing
+mb$results$multivar$all <- lapply(setNames(y_vars, y_vars), function(var1){
+    lapply(setNames(x_vars, x_vars), function(var2){
+      tmp_covars <- setdiff(co_vars, unique(c(var1, var2)))
+      tmp_covars <- tmp_covars[get_n_unique(df, tmp_covars) > 1]
+        if (any(c(var1) %in% c("ER_status", "PR_status", "HER2_status"))){
+            tmp_covars <- setdiff(tmp_covars, "receptor_subtype")
+          }
+        if (var1 %in% c("stage_hi")){
+            tmp_covars <- setdiff(tmp_covars, "stage")
+          }
+      get_association(df, test_var = var2, ref_var = var1, co_vars = tmp_covars, verbose = FALSE)
+    })
+})
+
+# pvalue adjustment
+padj <- sapply(mb$results$multivar$all, function(var1){
+  sapply(var1, function(var2){ var2$res[,"p.value"] })
+}) |> padjust()
+res_padj <- padj |> rownames2col(col = var) |> tidyr::pivot_longer(-c(var), names_to = "endpoint", values_to = "padj")
+
+# confidence intervals
+ep <- c("os", "dss", "dfs")
+cox_df <- lapply(setNames(ep, ep), function(e){
+  vars <- names(mb$results$multivar$all[[e]])
+  tmp <- sapply(setNames(vars, vars), function(var){
+      tmp <- broom::tidy(mb$results$multivar$all[[e]][[var]]$fit, conf.int = TRUE, exponentiate = TRUE) |> subset(term == var) |> select(-term)
+      unlist(tmp[1, ], use.names = TRUE)
+  }) |> t() |> rownames2col(var)
+  tmp$endpoint <- e
+  tmp
+}) |> Reduce(f = rbind)
+
+cox_df <- dplyr::left_join(cox_df, res_padj)
+cox_df$signif <- ifelse(cox_df$padj <= 0.05, "signif.", "not signif.") |> factor(ordered = TRUE, levels = c("not signif.", "signif."))
+cox_df$var <- factor(cox_df$var, ordered = TRUE, levels = rev(unique(c(cox_df$var))))
+cox_df$conf.high[cox_df$conf.high > 100] <- Inf
+mb$results$multivar$all_results <- cox_df
+```
+
+```{r}
+# check proportional hazards assumption
+# stratified cox models can be fitted by providing get_association(strat_vars=c("receptor_subtype", ...)), which here only marginally affects the results
+zph <- mb$results$multivar$all[c("os", "dss", "dfs")] %S>% function(var1){
+  var1 %S>% function(var2){
+    survival::cox.zph(var2$fit)$table[1,"p"]
+  }
+}
+zph |> cxheatmap()
+
+# nothing relevant for os, dss; check for dfs
+mb$results$multivar$all$dfs$StromalScore$fit |> survival::cox.zph() |> plot()
+mb$results$multivar$all$dfs$Cbs_Mast_cells_resting$fit |> survival::cox.zph() |> plot()
+```
+
+
+Multivariate analysis of patient subgroups
+```{r}
+mc_vars <- c("Cbs_Mast_cells_resting", "Cbs_Mast_cells_activated")
+y_vars = c("os", "dss", "dfs", setdiff(x_vars, mc_vars))
+
+# subgroups
+mb_subgroup_data <- list(receptor_subtype = split(df, df$receptor_subtype),
+                         ER_status = split(df, df$ER_status),
+                         HER2_status = split(df, df$HER2_status),
+                         PR_status = split(df, df$PR_status),
+                         histological_subtype = split(df, df$histological_subtype))
+mb_subgroup_data <- unlist(mb_subgroup_data, recursive = FALSE)
+mb_subgroup_data <- mb_subgroup_data[sapply(mb_subgroup_data, nrow) > 100]
+
+# testing
+mb$results$multivar$subgroups <- mb_subgroup_data %L>% function(df_subgroup){
+  subgroup_var <- sub("\\..*", "", .name)
+  lapply(setNames(y_vars, y_vars), function(var1){
+    lapply(setNames(mc_vars, mc_vars), function(var2){
+      tmp_covars <- setdiff(co_vars, unique(c(subgroup_var, var1, var2)))
+      tmp_covars <- tmp_covars[get_n_unique(df_subgroup, tmp_covars) > 1]
+        if (any(c(var1, subgroup_var) %in% c("ER_status", "PR_status", "HER2_status"))){
+            tmp_covars <- setdiff(tmp_covars, "receptor_subtype")
+          }
+        if (var1 %in% c("stage_hi")){
+            tmp_covars <- setdiff(tmp_covars, "stage")
+          }
+      get_association(df_subgroup, test_var = var2, ref_var = var1, co_vars = tmp_covars, verbose = FALSE)
+    })
+  })
+}
+
+# pvalue adjustment
+padj <- lapply(mb$results$multivar$subgroups, function(res){
+  padj <- sapply(res, function(var1){
+   sapply(var1, function(var2){ if (!any(is.na(var2$res))){ var2$res[,"p.value"] } else NA })
+  }) |> padjust()
+  padj |> rownames2col(col = xvar) |> tidyr::pivot_longer(-c(xvar), names_to = "var", values_to = "padj")
+})
+padj <- padj %L>% dplyr::mutate(subgroup = .name)
+padj <- Reduce(f = rbind, padj)
+
+# model estimates
+df_na <- data.frame(
+  estimate = NA,
+  std.error = NA,
+  statistic = NA,
+  p.value = NA,
+  conf.low = NA,
+  conf.high = NA
+)
+xvar <- "Cbs_Mast_cells_resting"
+cox_df_mc_resting <- mb$results$multivar$subgroups %L>% function(group_res){
+  res <- group_res %S>% function(var){
+    varname <- .name
+    fit <- var[[xvar]]$fit
+    res <- df_na
+    if (!all(is.na(fit))){
+      if (tolower(varname) %in% c("os", "dss", "dfs")){
+        res <- broom::tidy(fit, conf.int = TRUE, exponentiate = TRUE) |> dplyr::filter(term == xvar) |> select(-term)
+      } else {
+        res <- broom::tidy(fit, conf.int = TRUE, exponentiate = FALSE) |> dplyr::filter(term == .name) |> select(-term)
+      }
+    }
+    setNames(as.numeric(res), colnames(res))
+  }
+  res <- as.data.frame(t(res)) |> rownames2col(var)
+  res$subgroup <- .name
+  res
+}
+cox_df_mc_resting <- cox_df_mc_resting|> Reduce(f = rbind)
+cox_df_mc_resting <- dplyr::left_join(cox_df_mc_resting, subset(padj, xvar == "Cbs_Mast_cells_resting"))
+cox_df_mc_resting$group <- cox_df_mc_resting$subgroup |> sub(pattern="\\..*", replacement = "")
+cox_df_mc_resting$level <- cox_df_mc_resting$subgroup |> sub(pattern=".*\\.", replacement = "")
+cox_df_mc_resting$level <- factor(cox_df_mc_resting$level, levels=rev(c("HR+HER2-", "HER2+", "TNBC", "ER+", "ER-", "PR+", "PR-", "HER2-", "IDC", "ILC", "other")))
+mb$results$multivar$subgroups_results_mc_resting <- cox_df_mc_resting
+
+xvar <- "Cbs_Mast_cells_activated"
+cox_df_mc_activated <- mb$results$multivar$subgroups %L>% function(group_res){
+  res <- group_res %S>% function(var){
+    varname <- .name
+    fit <- var[[xvar]]$fit
+    res <- df_na
+    if (!all(is.na(fit))){
+      if (tolower(varname) %in% c("os", "dss", "dfs")){
+        res <- broom::tidy(fit, conf.int = TRUE, exponentiate = TRUE) |> dplyr::filter(term == xvar) |> select(-term)
+      } else {
+        res <- broom::tidy(fit, conf.int = TRUE, exponentiate = FALSE) |> dplyr::filter(term == .name) |> select(-term)
+      }
+    }
+    setNames(as.numeric(res), colnames(res))
+  }
+  res <- as.data.frame(t(res)) |> rownames2col(var)
+  res$subgroup <- .name
+  res
+}
+cox_df_mc_activated <- cox_df_mc_activated |> Reduce(f = rbind)
+cox_df_mc_activated <- dplyr::left_join(cox_df_mc_activated, subset(padj, xvar == "Cbs_Mast_cells_activated"))
+cox_df_mc_activated$group <- cox_df_mc_activated$subgroup |> sub(pattern="\\..*", replacement = "")
+cox_df_mc_activated$level <- cox_df_mc_activated$subgroup |> sub(pattern=".*\\.", replacement = "")
+cox_df_mc_activated$level <- factor(cox_df_mc_activated$level, levels=rev(c("HR+HER2-", "HER2+", "TNBC", "ER+", "ER-", "PR+", "PR-", "HER2-", "IDC", "ILC", "other")))
+mb$results$multivar$subgroups_results_mc_activated <- cox_df_mc_activated
+```
+
+```{r}
+zph <- mb$results$multivar$subgroups %L>% function(x){
+  res <- x[c("os", "dss", "dfs")] %S>% function(var1){
+    var1 %S>% function(var2){
+      survival::cox.zph(var2$fit)$table[1,"p"]
+    }
+  }
+  res <- as.data.frame(res) |> rownames2col(var)
+  res$group <- .name
+  res
+} 
+Reduce(f = rbind, zph) |> dplyr::arrange(os)
+
+# check IDC
+mb$results$multivar$subgroups$histological_subtype.IDC$os$Cbs_Mast_cells_resting$fit |> survival::cox.zph() |> plot()
+```
+
+DEG analysis for subgroups
+```{r}
+if (!file.exists(fp(params$data, "genesets.rds"))){
+  gs <- getMSigDB(c("H", "C2|CP:KEGG_LEGACY", "C5|GO:BP|GO:CC|GO:MF"))
+} else {
+  gs <- readRDS(fp(params$data, "genesets.rds"))
+}
+cbs_sig <- read.delim("../lib/cibersort/LM22.txt")
+cbs_sig$gene <- cbs_sig$Gene.symbol
+rownames(cbs_sig) <- cbs_sig$Gene.symbol
+```
+
+Prepare data for DGEA
+```{r}
+dfde <- mb$data
+dfde$receptor_status <- dfde$receptor_status |> make.names()
+dfde$receptor_subtype <- dfde$receptor_subtype |> make.names()
+dfde$stage <- dfde$stage |> make.names()
+dfde$HER2_status_orig <- dfde$HER2_status
+dfde$HER2_status <- dfde$HER2_status_orig |> gsub(pattern = "\\+", replacement = "pos") |> gsub(pattern = "-", replacement = "neg")
+dfde$HER2_status[is.na(dfde$HER2_status)] <- "other"
+dfde$histological_subtype <- dfde$histological_subtype |> make.names()
+rownames(dfde) <- dfde$ID
+```
+
+DGEA and GSEA
+```{r}
+dfde$HR_status <- (((dfde$ER_status == "ER+") | (dfde$PR_status == "PR+")) & (dfde$HER2_status == "HER2neg")) |> ifelse("HRpos", "HRneg")
+table(dfde$HR_status)
+table(dfde[,c("HR_status", "ER_status")])
+table(dfde[,c("HR_status", "PR_status")])
+table(dfde[,c("HR_status", "HER2_status")])
+dfsub <- subset(dfde, HR_status == "HRpos")
+table(dfsub$receptor_subtype)
+dfsub <- dfsub |> select(ID, Cbs_Mast_cells_resting, Cbs_Mast_cells_activated, stage, age, grade, histological_subtype) |> tidyr::drop_na()
+dfsub$Mast_cells_resting_hilo <- dfsub$Cbs_Mast_cells_resting |> stratify(n = 2)
+dfsub$Mast_cells_activated_hilo <- dfsub$Cbs_Mast_cells_activated  |> stratify(n = 2)
+
+# resting
+res <- runLIMMA(mb$expr[,dfsub$ID], design = dfsub,
+                formula = ~ Mast_cells_resting_hilo + stage + age + grade + histological_subtype,
+                contrasts = list("Mast_cells" = c("Mast_cells_resting_hilo", "Hi", "Lo")), do_log = FALSE)
+mb$results$dgea$mc_resting <- res$results$Mast_cells
+mb$results$dgea$mc_resting$Cbs_score <- cbs_sig[mb$results$dgea$mc_resting$id,"Mast.cells.resting"]
+mb$results$dgea$mc_resting$Cbs_score[is.na(mb$results$dgea$mc_resting$Cbs_score)] <- 0
+mb$results$dgea$mc_resting$name <- mb$results$dgea$mc_resting$id
+mb$results$gsea$mc_resting <- mb$results$dgea$mc_resting |> runGSEA(rank_by = "log2FC", genesets = gs)
+
+# activated
+res <- runLIMMA(mb$expr[,dfsub$ID], design = dfsub,
+                formula = ~ Mast_cells_activated_hilo + stage + age + grade + histological_subtype,
+                contrasts = list("Mast_cells" = c("Mast_cells_activated_hilo", "Hi", "Lo")), do_log = FALSE)
+mb$results$dgea$mc_activated <- res$results$Mast_cells
+mb$results$dgea$mc_activated$Cbs_score <- cbs_sig[mb$results$dgea$mc_activated$id,"Mast.cells.activated"]
+mb$results$dgea$mc_activated$Cbs_score[is.na(mb$results$dgea$mc_activated$Cbs_score)] <- 0
+mb$results$dgea$mc_activated$name <- mb$results$dgea$mc_activated$id
+mb$results$gsea$mc_activated <- mb$results$dgea$mc_activated |> runGSEA(rank_by = "log2FC", genesets = gs)
+```
+
+```{r}
+saveRDS(mb$results, fp(params$data, "mb_results.rds"))
+```

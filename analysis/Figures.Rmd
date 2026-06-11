@@ -1,0 +1,620 @@
+---
+title: "Figures"
+params:
+  data: "../data"
+  results:  "../results"
+---
+
+Code to reproduce paper figures based on the results from:
+- METABRIC.Rmd
+- TCGA-BRCA.Rmd
+- scRNAseq.Rmd
+
+```{r setup}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(immunedeconv)
+library(Seurat)
+library(liana)
+library(AUCell)
+library(ggthemes)
+bcra_env <- new.env()
+source(file.path("..", "lib", "r-functions.R"), local = bcra_env) |> invisible()
+attach(bcra_env)
+dir.create(params$results, showWarnings = FALSE)
+```
+
+Load results
+```{r}
+mb <- readRDS(file.path(params$data, "mb.rds"))
+mb$results <- readRDS(file.path(params$data, "mb_results.rds"))
+tcga <- readRDS(file.path(params$data, "tcga.rds"))
+tcga$results <- readRDS(file.path(params$data, "tcga_results.rds"))
+sc <- readRDS(file.path(params$data, "sc_results.rds"))
+seu <- readRDS(file.path(params$data, "scatlas", "seu.rds"))
+```
+
+
+### Figure 1: Survival associations from multivariate analysis
+
+A. TCGA
+```{r}
+df <- tcga$results$multivar$all_results
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+df$var <- df$var |> as.character() |> gsub(pattern = "Cbs_", replacement = "") |> gsub(pattern = "_", replacement = " ")
+df$var <- factor(df$var, levels=rev(unique(df$var)))
+xlim = c(0.2, 3)
+breaks = c(0.25, 0.5, 1,  2, 3)
+panel_widths = c(0.4, 0.9, 1)
+ggforest_annotated(subset(df, endpoint == "os"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "OS") |>
+  saveplot(file = fp(params$results, "Fig1_TCGA_OS"), dev = "pdf", width = 2200, height = 1800)
+ggforest_annotated(subset(df, endpoint == "dss"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "DSS") |>
+  saveplot(file = fp(params$results, "Fig1_TCGA_DSS"), dev = "pdf", width = 2200, height = 1800)
+ggforest_annotated(subset(df, endpoint == "dfs"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "DFS") |>
+  saveplot(file = fp(params$results, "Fig1_TCGA_DFS"), dev = "pdf", width = 2200, height = 1800)
+```
+
+B. METABRIC
+```{r}
+df <- mb$results$multivar$all_results
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+df$var <- df$var |> as.character() |> gsub(pattern = "Cbs_", replacement = "") |> gsub(pattern = "_", replacement = " ")
+df$var <- factor(df$var, levels=rev(unique(df$var)))
+xlim = c(0.6, 1.4)
+breaks = c(0.6, 0.8, 1,  1.2, 1.4)
+panel_widths = c(0.4, 0.9, 1)
+ggforest_annotated(subset(df, endpoint == "os"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "OS") |>
+  saveplot(file = fp(params$results, "Fig1_METABRIC_OS"), dev = "pdf", width = 2200, height = 1800)
+ggforest_annotated(subset(df, endpoint == "dss"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "DSS") |>
+  saveplot(file = fp(params$results, "Fig1_METABRIC_DSS"), dev = "pdf", width = 2200, height = 1800)
+ggforest_annotated(subset(df, endpoint == "dfs"), xlim = xlim, breaks=breaks, panel_widths = panel_widths, title = "DFS") |>
+  saveplot(file = fp(params$results, "Fig1_METABRIC_DFS"), dev = "pdf", width = 2200, height = 1800)
+```
+
+
+### Figure 2 and Supplemental Fig. 1,2: Mast cells across subgroups
+
+```{r}
+# METABRIC
+plotdf_mb <- mb$data
+vars_mb <-  c("receptor_subtype", "PAM50", "grade", "histological_subtype", "receptor_group", "stage") 
+plotdf_mb$receptor_group <- factor(plotdf_mb$receptor_group, ordered = TRUE, levels = c("E+(P+)", "H+(E+)(P+)", "---"))
+plotdf_mb$receptor_subtype <- factor(plotdf_mb$receptor_subtype, ordered = TRUE, levels = c("HR+HER2-", "HER2+", "TNBC", "other"))
+plotdf_mb$PAM50 <- plotdf_mb$PAM50_subtype
+plotdf_mb$PAM50[plotdf_mb$PAM50 == "Normal"] <- NA
+plotdf_mb$PAM50 <- factor(plotdf_mb$PAM50, ordered = TRUE, levels = c("LumA", "LumB", "Her2e", "Basal"))
+plotdf_mb$histological_subtype <- factor(plotdf_mb$histological_subtype, ordered = TRUE, levels = c("ILC", "IDC", "other"))
+
+# TCGA
+plotdf_tcga <- tcga$data
+vars_tcga <-  c("receptor_subtype", "PAM50", "histological_subtype", "receptor_group", "stage")
+plotdf_tcga$receptor_group <- factor(plotdf_tcga$receptor_group, ordered = TRUE, levels = c("E+(P+)", "H+(E+)(P+)", "---"))
+plotdf_tcga$receptor_subtype <- factor(plotdf_tcga$receptor_subtype, ordered = TRUE, levels = c("HR+HER2-", "HER2+", "TNBC", "other"))
+plotdf_tcga$PAM50 <- plotdf_tcga$PAM50_subtype
+plotdf_tcga$PAM50[plotdf_tcga$PAM50 == "Normal"] <- NA
+plotdf_tcga$PAM50 <- factor(plotdf_tcga$PAM50, ordered = TRUE, levels = c("LumA", "LumB", "Her2e", "Basal"))
+plotdf_tcga$histological_subtype <- factor(plotdf_tcga$histological_subtype, ordered = TRUE, levels = c("ILC", "IDC", "other"))
+```
+
+Fig. 2. Resting mast cells
+```{r}
+var_num = "Cbs_Mast_cells_resting"
+ymax = 0.7
+ggs_mb_rest <- setNames(vars_mb, vars_mb) |> lapply(function(var_cat){
+  plotdf <- plotdf_mb |> dplyr::select(var_cat, var_num) |> tidyr::drop_na() |> var_as_factor(var_cat, add_n = TRUE, sort_n=FALSE)
+  rot_x <- ifelse(max(sapply(unique(plotdf[[var_cat]]), function(x) nchar(as.character(x)) ), na.rm = TRUE) > 4, 90, 0)
+  ggboxplot(plotdf, x = var_cat, y = var_num, y_at_zero = FALSE, ymax = ymax, fontsize = 28, point_size = 2, linewidth = 1, points_color = var_cat, rot_x = rot_x) |> 
+      add_comparisons(TESTFUN = function(x, y, ...){ if(all(is.na(x)) | all(is.na(y))){return(NA)};
+        wilcox.test(x, y)$p.value }, padj_thres = 0.05, max_add = 10, spacing = 0.07, linewidth = 1, label_offset = 0.03, fontsize = 20,  ymax = ymax, na.omit = TRUE) +
+      xlab("") + ggtitle("METABRIC")
+  })
+ggs_tcga_rest <- setNames(vars_tcga, vars_tcga) |> lapply(function(var_cat){
+  plotdf <- plotdf_tcga |> dplyr::select(var_cat, var_num) |> tidyr::drop_na() |> var_as_factor(var_cat, add_n = TRUE, sort_n=FALSE)
+  rot_x <- ifelse(max(sapply(unique(plotdf[[var_cat]]), function(x) nchar(as.character(x)) ), na.rm = TRUE) > 4, 90, 0)
+  ggboxplot(plotdf, x = var_cat, y = var_num, y_at_zero = FALSE, ymax = ymax, fontsize = 28, point_size = 2, linewidth = 1, points_color = var_cat, rot_x = rot_x) |> 
+      add_comparisons(TESTFUN = function(x, y, ...){ if(all(is.na(x)) | all(is.na(y))){return(NA)};
+        wilcox.test(x, y)$p.value }, padj_thres = 0.05, max_add = 10, spacing = 0.07, linewidth = 1, label_offset = 0.03, ymax = ymax, fontsize = 20, na.omit = TRUE) +
+      xlab("") + ggtitle("TCGA")
+  })
+
+wrap_plots(ggs_mb_rest$receptor_subtype, ggs_tcga_rest$receptor_subtype,
+           ggs_mb_rest$PAM50, ggs_tcga_rest$PAM50, ggs_mb_rest$grade,
+           ggs_mb_rest$histological_subtype, ggs_tcga_rest$histological_subtype,
+           ncol = 4) |>
+  saveplot(file = fp(params$results, paste0("Fig2_Mast_cells_resting")), dev = "pdf", width = 2000*4, height = 3000*2)
+```
+
+Supp. Fig. 1. Resting mast cells (stage)
+```{r}
+wrap_plots(ggs_tcga_rest$stage, ggs_mb_rest$stage, ncol = 2) |>
+  saveplot(file = fp(params$results, paste0("SuppFig1_Mast_cells_resting_stage")), dev = "pdf", width = 2000*2, height = 3000)
+```
+
+Supp. Fig. 2. Activated mast cells
+```{r}
+var_num = "Cbs_Mast_cells_activated"
+ymax = 0.45
+ggs_mb_act <- setNames(vars_mb, vars_mb) |> lapply(function(var_cat){
+  plotdf <- plotdf_mb |> dplyr::select(var_cat, var_num) |> tidyr::drop_na() |> var_as_factor(var_cat, add_n = TRUE, sort_n=FALSE)
+  rot_x <- ifelse(max(sapply(unique(plotdf[[var_cat]]), function(x) nchar(as.character(x)) ), na.rm = TRUE) > 4, 90, 0)
+  ggboxplot(plotdf, x = var_cat, y = var_num, y_at_zero = FALSE, ymax = ymax, fontsize = 28, point_size = 2, linewidth = 1, points_color = var_cat, rot_x = rot_x) |> 
+      add_comparisons(TESTFUN = function(x, y, ...){ if(all(is.na(x)) | all(is.na(y))){return(NA)};
+        wilcox.test(x, y)$p.value }, padj_thres = 0.05, max_add = 10, spacing = 0.07, linewidth = 1, label_offset = 0.03, fontsize = 20, ymax = ymax, na.omit = TRUE) +
+      xlab("") + ggtitle("METABRIC")
+  })
+ymax = 0.25
+ggs_tcga_act <- setNames(vars_tcga, vars_tcga) |> lapply(function(var_cat){
+  plotdf <- plotdf_tcga |> dplyr::select(var_cat, var_num) |> tidyr::drop_na() |> var_as_factor(var_cat, add_n = TRUE, sort_n=FALSE)
+  rot_x <- ifelse(max(sapply(unique(plotdf[[var_cat]]), function(x) nchar(as.character(x)) ), na.rm = TRUE) > 4, 90, 0)
+  ggboxplot(plotdf, x = var_cat, y = var_num, y_at_zero = FALSE, ymax = ymax, fontsize = 28, point_size = 2, linewidth = 1, points_color = var_cat, rot_x = rot_x) |> 
+      add_comparisons(TESTFUN = function(x, y, ...){ if(all(is.na(x)) | all(is.na(y))){return(NA)};
+        wilcox.test(x, y)$p.value }, padj_thres = 0.05, max_add = 10, spacing = 0.07, linewidth = 1, label_offset = 0.03, ymax = ymax, fontsize = 20, na.omit = TRUE) +
+      xlab("") + ggtitle("TCGA")
+  })
+
+wrap_plots(ggs_tcga_act$receptor_subtype, ggs_tcga_act$PAM50,
+           ggs_tcga_act$histological_subtype, ggs_tcga_act$stage,
+           ggs_mb_act$receptor_subtype,  ggs_mb_act$PAM50, plot_spacer(), plot_spacer(),
+           ggs_mb_act$grade, ggs_mb_act$stage, ggs_mb_act$histological_subtype,
+           ncol = 4) |>
+  saveplot(file = fp(params$results, paste0("SuppFig2_Mast_cells_activated")), dev = "pdf", width = 2000*4, height = 3000*3)
+```
+
+
+### Figure 3 and Supplemental Fig. 3: Survival associations in subgroups
+
+```{r}
+# MB resting
+df <- subset(mb$results$multivar$subgroups_results_mc_resting, var %in% c("os", "dss", "dfs"))
+df$signif <- ifelse(df$padj <= 0.05, "signif.", "not signif.")
+df <- subset(df, !is.na(var))
+df$conf.high[df$conf.high > 100] <- Inf
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+xlim = c(0.5, 4)
+breaks = c(0.5, 1, 2, 4)
+width_total <- c(0.15, 0.9, 0.9) / sum(c(0.15, 0.9, 0.9)) * 2000
+for (ep in c("os", "dss", "dfs")){
+  ggs <- unique(df$group) %L>% function(sub_group){
+    ggdf <- subset(df, ep == var & group == sub_group) |> select(-var)
+    ggforest_annotated(dplyr::mutate(ggdf, var=level), xlim = xlim, breaks=breaks, ylab = sub_group, panel_widths = width_total)
+  }
+  hs <- ggs %S>% function(x) nrow(x$data)
+  for (i in 1:(length(ggs)-1)){
+    ggs[[i]] <- ggs[[i]] + xlab("") + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+  }
+  gg <- wrap_plots(ggs, ncol = 1, heights = hs, guides = "collect", axes = "collect_x") +
+    plot_annotation(title = toupper(ep)) & theme(plot.title = element_text(size = 3*ggplot2:::.pt * 1.5, hjust = 0.5), plot.margin = margin(t = 5))
+  gg |> saveplot(file = fp(params$results, paste0("Fig3_METABRIC_Mast_cells_resting_", ep)), dev = "pdf", width = sum(width_total), height = 1700)
+}
+
+# MB activated
+df <- subset(mb$results$multivar$subgroups_results_mc_activated, var %in% c("os", "dss", "dfs"))
+df$signif <- ifelse(df$padj <= 0.05, "signif.", "not signif.")
+df <- subset(df, !is.na(var))
+df$conf.high[df$conf.high > 100] <- Inf
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+xlim = c(0.1, 4)
+breaks = c(0.25, 0.5, 1, 2, 4)
+width_total <- c(0.15, 0.9, 0.9) / sum(c(0.15, 0.9, 0.9)) * 2000
+for (ep in c("os", "dss", "dfs")){
+  ggs <- unique(df$group) %L>% function(sub_group){
+    ggdf <- subset(df, ep == var & group == sub_group) |> select(-var)
+    ggforest_annotated(dplyr::mutate(ggdf, var=level), xlim = xlim, breaks=breaks, ylab = sub_group, panel_widths = width_total)
+  }
+  hs <- ggs %S>% function(x) nrow(x$data)
+  for (i in 1:(length(ggs)-1)){
+    ggs[[i]] <- ggs[[i]] + xlab("") + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+  }
+  gg <- wrap_plots(ggs, ncol = 1, heights = hs, guides = "collect", axes = "collect_x") +
+    plot_annotation(title = toupper(ep)) & theme(plot.title = element_text(size = 3*ggplot2:::.pt * 1.5, hjust = 0.5), plot.margin = margin(t = 5))
+  gg |> saveplot(file = fp(params$results, paste0("Fig3_METABRIC_Mast_cells_activated_", ep)), dev = "pdf", width = sum(width_total), height = 1700)
+}
+```
+
+```{r}
+# TCGA resting
+df <- subset(tcga$results$multivar$subgroups_results_mc_resting, var %in% c("os", "dss", "dfs"))
+df$signif <- ifelse(df$padj <= 0.05, "signif.", "not signif.")
+df <- subset(df, !is.na(var))
+df$conf.high[df$conf.high > 100] <- Inf
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+xlim = c(0.1, 4)
+breaks = c(0.25, 0.5, 1, 2, 4)
+width_total <- c(300, 700, 1000)
+width_total <- c(0.15, 0.9, 0.9) / sum(c(0.15, 0.9, 0.9)) * 2000
+for (ep in c("os", "dss", "dfs")){
+  ggs <- unique(df$group) %L>% function(sub_group){
+    ggdf <- subset(df, ep == var & group == sub_group) |> select(-var)
+    ggforest_annotated(dplyr::mutate(ggdf, var=level), xlim = xlim, breaks=breaks, ylab = sub_group, panel_widths = width_total)
+  }
+  hs <- ggs %S>% function(x) nrow(x$data)
+  for (i in 1:(length(ggs)-1)){
+    ggs[[i]] <- ggs[[i]] + xlab("") + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+  }
+  gg <- wrap_plots(ggs, ncol = 1, heights = hs, guides = "collect", axes = "collect_x") +
+    plot_annotation(title = toupper(ep)) & theme(plot.title = element_text(size = 3*ggplot2:::.pt * 1.5, hjust = 0.5), plot.margin = margin(t = 5))
+  gg |> saveplot(file = fp(params$results, paste0("Fig3_TCGA_Mast_cells_resting_", ep)), dev = "pdf", width = sum(width_total), height = 1700)
+}
+
+# TCGA activated
+df <- subset(tcga$results$multivar$subgroups_results_mc_activated, var %in% c("os", "dss", "dfs"))
+df$signif <- ifelse(df$padj <= 0.05, "signif.", "not signif.")
+df <- subset(df, !is.na(var))
+df$conf.high[df$conf.high > 100] <- Inf
+label_hr <- sprintf("HR = %.2f (%.2f–%.2f)", df$estimate, df$conf.low, df$conf.high)
+label_p <- sprintf("p = %.2f", df$padj)
+df$label <- paste0(label_hr, ", ", label_p)
+xlim = c(0.5, 4)
+breaks = c(0.5, 1, 2, 4)
+width_total <- c(300, 700, 1000)
+width_total <- c(0.15, 0.9, 0.9) / sum(c(0.15, 0.9, 0.9)) * 2000
+for (ep in c("os", "dss", "dfs")){
+  ggs <- unique(df$group) %L>% function(sub_group){
+    ggdf <- subset(df, ep == var & group == sub_group) |> select(-var)
+    ggforest_annotated(dplyr::mutate(ggdf, var=level), xlim = xlim, breaks=breaks, ylab = sub_group, panel_widths = width_total)
+  }
+  hs <- ggs %S>% function(x) nrow(x$data)
+  for (i in 1:(length(ggs)-1)){
+    ggs[[i]] <- ggs[[i]] + xlab("") + theme(axis.line.x = element_blank(), axis.ticks.x = element_blank(), axis.text.x = element_blank())
+  }
+  gg <- wrap_plots(ggs, ncol = 1, heights = hs, guides = "collect", axes = "collect_x") +
+    plot_annotation(title = toupper(ep)) & theme(plot.title = element_text(size = 3*ggplot2:::.pt * 1.5, hjust = 0.5), plot.margin = margin(t = 5))
+  gg |> saveplot(file = fp(params$results, paste0("Fig3_TCGA_Mast_cells_activated_", ep)), dev = "pdf", width = sum(width_total), height = 1700)
+}
+```
+
+
+### Fig. 4: Immunological associations in subgroups
+
+```{r}
+# METABRIC resting
+effect <- mb$results$multivar$subgroups_results_mc_resting |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, estimate, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = estimate) |> as.data.frame() |> col2rownames(subgroup)
+padj <- mb$results$multivar$subgroups_results_mc_resting |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, padj, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = padj) |> as.data.frame() |> col2rownames(subgroup)
+heatpal = circlize::colorRamp2(breaks = c(-0.5,0,0.5), colors = c("blue", "white", "red"))
+cols <- colnames(effect)
+cxheatmap(effect[,cols], title = "effect", cluster_rows = F, cluster_cols = F, mat = naf(padj[,cols] <= 0.05), heatpal=heatpal, row_title="subgroup") |>
+  saveplot(file.path(params$results, "Fig4_METABRIC_Mast_cells_resting"), width = 5000, height = 2200, dev="pdf")
+
+# METABRIC activated
+effect <- mb$results$multivar$subgroups_results_mc_activated |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, estimate, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = estimate) |> as.data.frame() |> col2rownames(subgroup)
+padj <- mb$results$multivar$subgroups_results_mc_activated |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, padj, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = padj) |> as.data.frame() |> col2rownames(subgroup)
+heatpal = circlize::colorRamp2(breaks = c(-0.5,0,0.5), colors = c("blue", "white", "red"))
+cols <- colnames(effect)
+cxheatmap(effect[,cols], title = "effect", cluster_rows = F, cluster_cols = F, mat = naf(padj[,cols] <= 0.05), heatpal=heatpal, row_title="subgroup") |>
+  saveplot(file.path(params$results, "Fig4_METABRIC_Mast_cells_activated"), width = 5000, height = 2200, dev="pdf")
+
+# TCGA resting
+effect <- tcga$results$multivar$subgroups_results_mc_resting |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, estimate, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = estimate) |> as.data.frame() |> col2rownames(subgroup)
+padj <- tcga$results$multivar$subgroups_results_mc_resting |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, padj, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = padj) |> as.data.frame() |> col2rownames(subgroup)
+heatpal = circlize::colorRamp2(breaks = c(-0.5,0,0.5), colors = c("blue", "white", "red"))
+cols <- colnames(effect)
+cxheatmap(effect[,cols], title = "effect", cluster_rows = F, cluster_cols = F, mat = naf(padj[,cols] <= 0.05), heatpal=heatpal, row_title="subgroup") |>
+  saveplot(file.path(params$results, "Fig4_TCGA_Mast_cells_resting"), width = 5000, height = 2200, dev="pdf")
+
+# TCGA activated
+effect <- tcga$results$multivar$subgroups_results_mc_activated |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, estimate, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = estimate) |> as.data.frame() |> col2rownames(subgroup)
+padj <- tcga$results$multivar$subgroups_results_mc_activated |>
+  subset(!var %in% c("os", "dss", "dfs")) |>
+  dplyr::select(var, padj, subgroup) |>
+  tidyr::pivot_wider(names_from = var, id_cols = subgroup, values_from = padj) |> as.data.frame() |> col2rownames(subgroup)
+heatpal = circlize::colorRamp2(breaks = c(-0.5,0,0.5), colors = c("blue", "white", "red"))
+cols <- colnames(effect)
+cxheatmap(effect[,cols], title = "effect", cluster_rows = F, cluster_cols = F, mat = naf(padj[,cols] <= 0.05), heatpal=heatpal, row_title="subgroup") |>
+  saveplot(file.path(params$results, "Fig4_TCGA_Mast_cells_activated"), width = 5000, height = 2200, dev="pdf")
+```
+
+### Fig. 5: DGEA & GSEA
+```{r}
+# genes of interest
+mcde <- list(
+  resting_up = ce(CPA3,TPSAB1,STC2,SCGB2A2,MS4A2,CTSG,KITLG,SRARP,HDC,OGN,SCGB1D2,SHISA2,VTCN1,RHEX),
+  resting_down = ce(NKG7,SLAMF6,SLC7A5,LAG3,GBP5,ADAMDEC1,MMP9,CXCL9,CXCL10,CXCL13),
+  activated_up = ce(ATF3,CCL3,CCL3L3,CCL4,CCN1,CXCL8,DUSP1,EGR1,EGR2,FCGBP,FOS,FOSB,HBEGF,IL1B,JUNB,PIP,PLAT,PTGS2,RASD1,SPP1,TFF1,ZFP36),
+  activated_down = ce(GBP4,GZMK,LAMP3,NKG7,CXCL9,CCL19,CXCL13,CD2,CD3D,GZMA,LTB,SPOCK2)
+)
+goi_rest <- mcde[1:2] |> unlist() |> unique()
+goi_act <- mcde[3:4] |> unlist() |> unique()
+
+mb$results$dgea$mc_resting$name <- mb$results$dgea$mc_resting$id
+mb$results$dgea$mc_activated$name <- mb$results$dgea$mc_activated$id
+tcga$results$dgea$mc_resting$name <- tcga$results$dgea$mc_resting$id
+tcga$results$dgea$mc_activated$name <- tcga$results$dgea$mc_activated$id
+
+## Optionally unlabel genes with high expression in the Cibersort signature
+# mb$results$dgea$mc_resting$name[mb$results$dgea$mc_resting$Cbs_score > 500] <- ""
+# mb$results$dgea$mc_activated$name[mb$results$dgea$mc_activated$Cbs_score > 500] <- ""
+# tcga$results$dgea$mc_resting$name[tcga$results$dgea$mc_resting$Cbs_score > 500] <- ""
+# tcga$results$dgea$mc_activated$name[tcga$results$dgea$mc_activated$Cbs_score > 500] <- ""
+
+n_genes <- 15
+top_goi_rest <- mb$results$dgea$mc_resting$id[mb$results$dgea$mc_resting$id %in% goi_rest]
+mb$results$dgea$mc_resting$name[!mb$results$dgea$mc_resting$id %in% unique(c(get_top_genes(mb$results$dgea$mc_resting, n = 5), top_goi_rest))[1:n_genes]] <- ""
+top_goi_act <- mb$results$dgea$mc_activated$id[mb$results$dgea$mc_activated$id %in% goi_act]
+mb$results$dgea$mc_activated$name[!mb$results$dgea$mc_activated$id %in% unique(c(get_top_genes(mb$results$dgea$mc_activated, n = 5), top_goi_act))[1:n_genes]] <- ""
+top_goi_rest <- tcga$results$dgea$mc_resting$id[tcga$results$dgea$mc_resting$id %in% goi_rest]
+tcga$results$dgea$mc_resting$name[!tcga$results$dgea$mc_resting$id %in% unique(c(get_top_genes(tcga$results$dgea$mc_resting, n = 5), top_goi_rest))[1:n_genes]] <- ""
+top_goi_act <- tcga$results$dgea$mc_activated$id[tcga$results$dgea$mc_activated$id %in% goi_act]
+tcga$results$dgea$mc_activated$name[!tcga$results$dgea$mc_activated$id %in% unique(c(get_top_genes(tcga$results$dgea$mc_activated, n = 5), top_goi_act))[1:n_genes]] <- ""
+```
+
+Volcano plots (left panel)
+```{r}
+# METABRIC resting
+fontsize <- 15
+ggs1 <- list(
+  mb$results$dgea$mc_resting |> ggvolcano(ylim = c(0, 120), max_overlaps = Inf, label = name, nlabels = Inf, show_grid = FALSE, lab_size = 6,
+                                          label_up = "Mast_cells_resting_HI", label_down = "Mast_cells_resting_LO", raster=TRUE, raster_dpi = 900), 
+# METABRIC activated
+mb$results$dgea$mc_activated |> ggvolcano(ylim = c(0, 35), max_overlaps = Inf, label = name, nlabels = Inf, show_grid = FALSE, lab_size = 6,
+                                          label_up = "Mast_cells_activated_HI", label_down = "Mast_cells_activated_LO", raster=TRUE, raster_dpi = 900),
+# TCGA resting
+tcga$results$dgea$mc_resting |> ggvolcano(ylim = c(0, 45), max_overlaps = Inf,label = name, nlabels = Inf, show_grid = FALSE, lab_size = 6,
+                                          label_up = "Mast_cells_resting_HI", label_down = "Mast_cells_resting_LO", raster=TRUE, raster_dpi = 900),
+# TCGA activated
+tcga$results$dgea$mc_activated |> ggvolcano(ylim = c(0, 8), max_overlaps = Inf,label = name, nlabels = Inf, show_grid = FALSE, lab_size = 6,
+                                          label_up = "Mast_cells_activated_HI", label_down = "Mast_cells_activated_LO", raster=TRUE, raster_dpi = 900)
+)
+ggs1 <- lapply(ggs1, function(gg){ gg + theme(axis.text.y = element_text(size = fontsize)) })
+```
+
+GSEA plots (right panel)
+```{r}
+# categories
+stroma_protein <- "matrix|ecm|epithe|external|collagen|cartilage|connect|integrin|basement|hyaluron|structural|wound|cell.substrate|adhesion|fiber|E2F|replication|ribosom|kineto|translation|endoplasmic reticulum"
+immunity <- "immun|allograft|antigen|interleu|interfer|b cell|t cell|killer|mhc|chemokine|cytokine|type I diabetes|another.organism|graft.v|viral|virus"
+selected <- "hypoxia|tnfa|estrogen"
+
+gseares <- list("METABRIC resting" = mb$results$gsea$mc_resting,
+                "METABRIC activated" = mb$results$gsea$mc_activated,
+                "TCGA resting" = tcga$results$gsea$mc_resting,
+                "TCGA activated" = tcga$results$gsea$mc_activated)
+
+gseares <- gseares %L>% function(x){
+  x$term <- gsub("_", " ", x$term) |> as.character()
+  x$category <- "other"
+  x$category[grepl(stroma_protein, x$term, ignore.case = TRUE)] <- "stromality & protein synthesis"
+  x$category[grepl(immunity, x$term, ignore.case = TRUE)] <- "immunity"
+  x$category[grepl(selected, x$term, ignore.case = TRUE)] <- "selected"
+  x$category <- factor(x$category, levels=c("immunity", "stromality & protein synthesis",  "other", "selected"))
+  x
+}
+cat_palette <- c(immunity="#8a1c07", "stromality & protein synthesis"="#0e90cc", other="#cccccc", "selected"="#fad814")
+ggs2 <- gseares %L>% ggsea_split_dotplot(., pal = cat_palette, title = .name, maxchar = 85, xmax = 3.1)
+```
+
+Combine
+```{r}
+gg_combined <- wrap_plots(c(ggs1, ggs2), byrow = FALSE, ncol = 2, widths = c(0.9, 1)) &
+  theme(plot.title = element_text(face = "bold", size = fontsize, hjust = 0, margin = margin(b = 10)),
+        line = element_line(linewidth = 0.8),
+        axis.title = element_text(size = fontsize),
+        axis.text.x = element_text(size = fontsize),
+        legend.text = element_text(size = fontsize),
+        legend.title = element_text(size = fontsize))
+gg_combined |> saveplot(file = fp(params$results, paste0("Fig5")), dev = "pdf",  width = 6700, height = 6500)
+```
+
+
+### Fig. 6 and Supplemental Fig. 4: scRNAseq results
+
+A-C. Composition
+```{r}
+meta_mast_cell_hilo <- sc$meta_frac |>
+  dplyr::group_by(mast_cell_hilo) |>
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::starts_with("n_"),
+      ~ mean(.x, na.rm = TRUE)
+    )
+  )
+colnames(meta_mast_cell_hilo)[-c(1:2)] <- colnames(meta_mast_cell_hilo)[-c(1:2)] |> gsub(pattern = "n_", replacement = "frac_")
+meta_mast_cell_hilo$n_cells <- NULL
+meta_mast_cell_hilo <- meta_mast_cell_hilo |> as.data.frame() |> col2rownames(mast_cell_hilo) |> t() |> as.data.frame()
+rownames(meta_mast_cell_hilo) <- rownames(meta_mast_cell_hilo) |> gsub(pattern = "frac_", replacement = "") |> gsub(pattern = "_", replacement = " ")
+tab_grade <- get_contable(filter(sc$meta_frac, grade != "nan") |> droplevels(), "mast_cell_hilo", "grade") |> t() |> as.data.frame()
+tab_grade <- (t(tab_grade) / colSums(tab_grade)) |> t()
+tab_pam50 <- get_contable(sc$meta_frac, "mast_cell_hilo", "PAM50") |> t() |> as.data.frame()
+tab_pam50 <- (t(tab_pam50) / colSums(tab_pam50)) |> t()
+ptdata <- list(mast_cell_hilo = rownames2col(meta_mast_cell_hilo, celltype), grade = rownames2col(tab_grade, grade), PAM50 = rownames2col(tab_pam50, PAM50))
+
+# celltype
+cols <- ggthemes::tableau_color_pal("Tableau 20")(11)
+df_long <- ptdata$mast_cell_hilo |>
+  tidyr::pivot_longer(cols = c(Lo, Hi), names_to = "mast_cell_hilo", values_to = "fraction")
+df_long$mast_cell_hilo <- factor(df_long$mast_cell_hilo, levels = c("Hi", "Lo"))
+gg3 <- ggplot(df_long, aes(x = mast_cell_hilo, y = fraction, fill = celltype)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "composition", fill = "celltype") +
+  theme_basic(fontsize = 20) +
+  theme(legend.position = "right", legend.justification = "left")+
+  scale_y_continuous(limits = c(0,1), expand = expansion()) +
+  scale_fill_manual(values = setNames(cols, unique(df_long$celltype)))
+
+# grade
+cols <- ggthemes::tableau_color_pal("Tableau 10")(5)
+cols <- c("#12a37a", "#f0b143", "#8594cc")
+ptdata$grade$grade <- as.character(as.numeric(ptdata$grade$grade))
+df_long <- ptdata$grade |>
+  tidyr::pivot_longer(cols = c(Lo, Hi), names_to = "mast_cell_hilo", values_to = "fraction")
+df_long$mast_cell_hilo <- factor(df_long$mast_cell_hilo, levels = c("Hi", "Lo"))
+gg2 <- ggplot(df_long, aes(x = mast_cell_hilo, y = fraction, fill = grade)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "composition", fill = "grade") +
+  theme_basic(fontsize = 20) +
+  theme(legend.position = "right", legend.justification = "left")+
+  scale_y_continuous(limits = c(0,1), expand = expansion()) +
+  scale_fill_manual(values = setNames(cols, unique(df_long$grade)))
+
+# PAM50
+pam50_colors <- c(
+  "LumA"  = "#1f77b4",
+  "LumB"  = "#aec7e8",
+  "Her2"  = "#f2a663",
+  "Basal" = "#f0546c",
+  "Normal"= "#519c62"
+)
+df_long <- ptdata$PAM50 |>
+  tidyr::pivot_longer(cols = c(Lo, Hi), names_to = "mast_cell_hilo", values_to = "fraction")
+df_long$mast_cell_hilo <- factor(df_long$mast_cell_hilo, levels = c("Hi", "Lo"))
+gg1 <- ggplot(df_long, aes(x = mast_cell_hilo, y = fraction, fill = PAM50)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "composition", fill = "PAM50") +
+  theme_basic(fontsize = 20) +
+  theme(legend.position = "right", legend.justification = "left")+
+  scale_y_continuous(limits = c(0,1), expand = expansion()) +
+  scale_fill_manual(values = pam50_colors)
+
+wrap_plots(list(gg1 + coord_flip(), gg2 + coord_flip(), gg3 + coord_flip()), nrow = 1) |>
+  saveplot(file.path(params$results, "Fig6abc_composition"), dev = "pdf", width = 7000, height = 1500)
+```
+
+D-F. GSEA
+```{r}
+gseares <- list(all = sc$deg_all$gsea$all, cancer_cells = sc$deg_cts$gsea$`cancer cell`, macrophages = sc$deg_cts$gsea$macrophage)
+gseares <- gseares %L>% function(x){
+  x$term <- gsub("_", " ", x$term) |> as.character()
+  x$category <- "other"
+  x$category[grepl("matrix|ecm|epithe|external|collagen|cartilage|connect|integrin|basement|hyaluron|structural|wound|cell.substrate|adhesion",
+                   x$term, ignore.case = TRUE)] <- "stromality"
+  x$category[grepl("E2F|replication|G2M|nucleosome|chromatin|proliferation|cell.cycle|DNA|mitotic|mitosis|ribosom|kineto|translation",
+                   x$term, ignore.case = TRUE)] <- "proliferation"
+  x$category[grepl("immun|allograft|antigen|interleu|interfer|b cell|t cell|killer|mhc|chemokine|cytokine|type I diabetes|another.organism|graft.v|viral|virus",
+                   x$term, ignore.case = TRUE)] <- "immunity"
+  x$category <- factor(x$category, levels=c("immunity",  "stromality",  "proliferation", "other"))
+  x
+}
+
+cat_palette=c(immunity="#8a1c07", stromality="#0e90cc", proliferation="#fad814", other="#cccccc")
+
+gg1 <- ggsea_split_dotplot(gseares$all, pal = cat_palette, title = "All cell types", xmax = 2.9)
+gg2 <- ggsea_split_dotplot(gseares$cancer_cells, pal = cat_palette, title="Cancer cells", xmax = 2.9)
+gg3 <- ggsea_split_dotplot(gseares$macrophages, pal = cat_palette, title="Macrophages", xmax = 2.9)
+(wrap_plots(gg1, gg2, gg3, ncol = 1, axes = "collect_x") & theme(plot.title = element_text(face = "bold", size = 12, hjust = 0, margin = margin(b = 10)))) |>
+  saveplot(file = fp(params$results, paste0("Fig6def_gsea")), dev = "pdf",  width = 3200, height = 5000)
+```
+
+G,H. Gene expression
+```{r}
+seu$cell_type_plot <- factor(seu$cell_type_coarse, ordered = TRUE, levels = rev(c(
+  "cancer cell", "stromal cell",
+  "endothelial cell", "pericyte", "smooth muscle cell", 
+  "B cell", "T cell","NK cell","dendritic cell","macrophage","mast cell"
+)))
+
+mcde <- list(
+  resting_up = ce(CPA3,TPSAB1,STC2,SCGB2A2,MS4A2,CTSG,KITLG,SRARP,HDC,OGN,SCGB1D2,SHISA2,VTCN1,RHEX),
+  resting_down = ce(NKG7,SLAMF6,SLC7A5,LAG3,GBP5,ADAMDEC1,MMP9,CXCL9,CXCL10,CXCL13),
+  activated_up = ce(ATF3,CCL3,CCL3L3,CCL4,CCN1,CXCL8,DUSP1,EGR1,EGR2,FCGBP,FOS,FOSB,HBEGF,IL1B,JUNB,PIP,PLAT,PTGS2,RASD1,SPP1,TFF1,ZFP36),
+  activated_down = ce(GBP4,GZMK,LAMP3,NKG7,CXCL9,CCL19,CXCL13,CD2,CD3D,GZMA,LTB,SPOCK2)
+)
+
+ggs <- mcde %L>% function(genes){
+  PlotDotplot(seu, group.by = "cell_type_plot", fontsize = 13, dot.scale = 5, col.min = 0, col.max = 1, size.min = 0, size.max = 100,
+              scale = FALSE, rescale = TRUE, guide_title = "rel. expr.", features = sort(as.character(genes))) + ggtitle(.name)
+}
+wrap_plots(ggs) |> saveplot(file.path(params$results, "Fig6gh_Selected_genes"), dev = "pdf", width = 4700, height = 2500)
+```
+
+I. LIANA dotplot
+```{r}
+dfplot <- subset(sc$liana_consensus, target == "mast cell")
+dfplot$LR <- paste0(dfplot$ligand.complex, " - ", dfplot$receptor.complex)
+dfplot$consensus_score <- -log10(dfplot$aggregate_rank + 1e-10)
+topLR <- dfplot |> dplyr::arrange(aggregate_rank) |> dplyr::pull(LR) |> unique()
+dfplot <- subset(dfplot, LR %in% topLR[1:40])
+dfplot <- dfplot |> dplyr::arrange(receptor.complex, ligand.complex)
+
+dfplot$source <- factor(dfplot$source, ordered = TRUE, levels = rev(c(
+  "cancer cell", "stromal cell",
+  "endothelial cell", "pericyte", "smooth muscle cell", 
+  "B cell", "T cell","NK cell","dendritic cell","macrophage","mast cell"
+)))
+
+dfplot$LR <- factor(as.character(dfplot$LR), levels = (unique(dfplot$LR)), ordered = TRUE)
+stopifnot(min(dfplot$connectome.weight_sc) > 0)
+
+gg <- ggplot(dfplot, aes(LR, source, color = consensus_score, size=connectome.weight_sc)) +
+  geom_point()
+
+gg <- gg +
+  theme_basic(grid.color = "gray90") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_color_gradient(low = "#099c7c", high = "#003bde") +
+  scale_size_continuous(range = c(0.5,10)) +
+  xlab(NULL) +
+  ylab(NULL) +
+  labs(size = "LR expression", colour = "Consensus score") +
+  guides(colour = guide_colorbar(barheight = 10, frame.colour = "black", frame.linewidth = 0.5, ticks.colour = "black"))
+
+gg |> saveplot(file.path(params$results, "Fig6i_LIANA"), dev = "pdf", width = 4000, height = 2000)
+```
+
+Supplemental Fig. 4. Mast cell subclustering
+```{r}
+cb <- guides(color = guide_colorbar(frame.colour = "black", ticks.colour = "black", frame.linewidth = 0.5))
+sccol <- scale_color_gradientn(colors = c("lightgrey", "blue"),limits = c(0, 0.55))
+
+ggs <- list(DimPlot(sc$seu_mast, group.by = c("mast_sub")) + ggtitle("Mast cell subcluster"),
+            FeaturePlot(sc$seu_mas, min.cutoff = 0, max.cutoff = 0.55, features = c("auc_rest")) + ggtitle("Resting mast cell score") + cb + sccol,
+            FeaturePlot(sc$seu_mas, min.cutoff = 0, max.cutoff = 0.55, features = c("auc_act")) + ggtitle("Activated mast cell score") + cb + sccol)
+ggs <- wrap_plots(ggs) & xlab("UMAP1") & ylab("UMAP2") &
+  coord_cartesian(xlim = c(-6,8), ylim = c(-5,5))
+
+ggs |> saveplot(file = fp(params$results, paste0("SuppFig4_Mast_cell_subclustering")), width = 4500, height = 1600, dev = "pdf")
+```
+
+
+### Supplemental Tables
+
+Supplemental Table 1. DGEA of METABRIC and TCGA samples
+```{r}
+tab1 <- list("METABRIC" = mb$results$dgea, "TCGA" = tcga$results$dgea) |> unlist(recursive = FALSE)
+tab1 <- tab1 %L>% dplyr::select(., -c(CIlower, CIupper, Cbs_score, name))
+writeTables(tab1, file = fp(params$results, "Suppl. Table 1.xlsx"), rowNames = FALSE, adjwidths = FALSE, keepNA = TRUE)
+```
+
+Supplemental Table 2. DGEA of scRNAseq samples
+```{r}
+cols <- setNames(c("gene", "log2FC", "padj"), c("Gene ID", "log2FC", "Adj. p value"))
+tab2 <- list("All cells" = sc$deg_all$deseq2$all[,cols],
+             "Cancer cells" = sc$deg_cts$deseq2$`cancer cell`[,cols],
+             "Macrophages" = sc$deg_cts$deseq2$macrophage[,cols])
+tab2 <- tab2 %L>% function(df){ colnames(df) <- names(cols); df }
+writeTables(tab2, file = fp(params$results, "Suppl. Table 2.xlsx"), rowNames = FALSE, adjwidths = FALSE, keepNA = TRUE)
+```
+
+```{r}
+devtools::session_info() |> capture.output(file = fp(params$results, "session_info.txt"))
+```
