@@ -1,7 +1,7 @@
 # brca-mast-cells-2026
 
 Analysis code accompanying
-> [Kirchmair et al., Genes & Immunity (2026)](https://www.nature.com/gene/)
+> [Kirchmair et al., Genes & Immunity (2026)](https://doi.org/10.1038/s41435-026-00409-y)
 
 This repository contains the code to reproduce the analysis of transcriptional signatures of mast cells in public breast cancer cohorts, as described below.
 
